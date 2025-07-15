@@ -3,12 +3,26 @@ import torch.distributed as dist
 from diffusers import HunyuanVideoPipeline, HunyuanVideoTransformer3DModel
 from diffusers.utils import export_to_video
 
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from modify_hunyuan import set_sage_attn_hunyuan
+import torch.nn.functional as F
+
 dist.init_process_group()
 
 torch.cuda.set_device(dist.get_rank())
 
 # [rank1]: RuntimeError: Expected mha_graph->execute(handle, variant_pack, workspace_ptr.get()).is_good() to be true, but got false.  (Could this error message be improved?  If so, please report an enhancement request to PyTorch.)
 # torch.backends.cuda.enable_cudnn_sdp(False)
+
+from jintao.core import jintao_sage
+
+ATTENTION = {
+    "sage": jintao_sage,
+    "sdpa": F.scaled_dot_product_attention,
+}
 
 model_id = "hunyuanvideo-community/HunyuanVideo"
 transformer = HunyuanVideoTransformer3DModel.from_pretrained(
@@ -27,6 +41,8 @@ pipe = HunyuanVideoPipeline.from_pretrained(
 from para_attn.context_parallel import init_context_parallel_mesh
 from para_attn.context_parallel.diffusers_adapters import parallelize_pipe
 from para_attn.parallel_vae.diffusers_adapters import parallelize_vae
+
+set_sage_attn_hunyuan(pipe.transformer, ATTENTION["sage"])
 
 mesh = init_context_parallel_mesh(
     pipe.device.type,
