@@ -10,18 +10,18 @@ torch.cuda.set_device(dist.get_rank())
 # [rank1]: RuntimeError: Expected mha_graph->execute(handle, variant_pack, workspace_ptr.get()).is_good() to be true, but got false.  (Could this error message be improved?  If so, please report an enhancement request to PyTorch.)
 # torch.backends.cuda.enable_cudnn_sdp(False)
 
-model_id = "tencent/HunyuanVideo"
+model_id = "hunyuanvideo-community/HunyuanVideo"
 transformer = HunyuanVideoTransformer3DModel.from_pretrained(
     model_id,
     subfolder="transformer",
     torch_dtype=torch.bfloat16,
-    revision="refs/pr/18",
+    # revision="refs/pr/18",
 )
 pipe = HunyuanVideoPipeline.from_pretrained(
     model_id,
     transformer=transformer,
     torch_dtype=torch.float16,
-    revision="refs/pr/18",
+    # revision="refs/pr/18",
 ).to("cuda")
 
 from para_attn.context_parallel import init_context_parallel_mesh
