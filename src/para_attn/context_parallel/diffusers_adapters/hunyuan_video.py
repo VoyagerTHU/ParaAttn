@@ -8,9 +8,16 @@ from diffusers.utils import logging, scale_lora_layers, unscale_lora_layers, USE
 
 import para_attn.primitives as DP
 from para_attn.context_parallel import init_context_parallel_mesh
-from para_attn.para_attn_interface import SparseKVAttnMode, UnifiedAttnMode
+from para_attn.para_attn_interface import SparseKVAttnMode, UnifiedAttnMode, UlyssesAttnMode
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+
+# 修改导入路径，使用同级文件夹的 jintao 中的 sageattn
+import sys
+import os
+sys.path.append("/mnt/vepfs/base2/chenyixiao/yingze/ParaAttention")
+from jintao import jintao_sage
+import torch.nn.functional as F
 
 
 def parallelize_transformer(transformer: HunyuanVideoTransformer3DModel, *, mesh=None):
@@ -99,6 +106,11 @@ def parallelize_transformer(transformer: HunyuanVideoTransformer3DModel, *, mesh
         new_attention_mask = torch.cat(new_attention_mask, dim=-1)
         attention_mask = new_attention_mask
 
+        # print(f"new_attention_mask: {attention_mask.shape}")
+        # print(f"new_attention_mask: {attention_mask[:,:,-1000:]}")
+        # # print 所有 false的index
+        # false_index = torch.where(attention_mask == False)
+        # print(f"new_attention_mask false_index: {false_index}")
         freqs_cos, freqs_sin = image_rotary_emb
 
         def get_rotary_emb_chunk(freqs):
@@ -109,7 +121,9 @@ def parallelize_transformer(transformer: HunyuanVideoTransformer3DModel, *, mesh
         freqs_sin = get_rotary_emb_chunk(freqs_sin)
         image_rotary_emb = (freqs_cos, freqs_sin)
 
-        with SparseKVAttnMode(), UnifiedAttnMode(mesh):
+        ulysses_mesh = mesh["ulysses"]
+
+        with UlyssesAttnMode(ulysses_mesh, attn_func=F.scaled_dot_product_attention):
             # 4. Transformer blocks
             hidden_states, encoder_hidden_states = self.call_transformer_blocks(
                 hidden_states, encoder_hidden_states, temb, attention_mask, image_rotary_emb

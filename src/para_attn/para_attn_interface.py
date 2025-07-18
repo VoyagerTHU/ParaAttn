@@ -32,6 +32,8 @@ try:
 except ImportError:
     torch_ring_attention = None
 
+from sageattention import sageattn
+
 __all__ = [
     "UnifiedAttnMode",
     "RingAttnMode",
@@ -111,12 +113,40 @@ def ulysses_attn_func(
     value = _sdpa_input_all_to_all(value, mesh)
 
     if attn_func is None:
+        print("attn_func is None, using F.scaled_dot_product_attention")
         attn_func = F.scaled_dot_product_attention
-
-    out = attn_func(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale)
+    
+    if attn_func == F.scaled_dot_product_attention:
+        out = attn_func(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale)
+    else:
+        # jintao_sage
+        world_size = DP.get_world_size(mesh)
+        key, value = concentrate_attn_mask(key, value, world_size)
+        text_false_length = (~attn_mask).sum(dim=-1).item()
+        out = attn_func(query, key, value, is_causal=is_causal, sm_scale=scale, text_false_length=text_false_length)
 
     out = _sdpa_output_all_to_all(out, mesh)
     return out
+
+def concentrate_attn_mask(key, value, world_size):
+    assert world_size in [1, 2, 4, 8]
+    b, h, s, d = key.shape
+    block_size = s // world_size
+    mask_block_size = 256 // world_size
+    new_key = []
+    new_value = []
+
+    for i in range(world_size):
+        new_key.append(key[:, :, i*block_size : (i+1)*block_size - mask_block_size, :])
+        new_value.append(value[:, :, i*block_size : (i+1)*block_size - mask_block_size, :])
+        # print(f"cut index for {i}: {i*block_size} - {(i+1)*block_size - mask_block_size}")
+    for i in range(world_size):
+        new_key.append(key[:, :, (i+1)*block_size - mask_block_size : (i+1)*block_size, :])
+        new_value.append(value[:, :, (i+1)*block_size - mask_block_size : (i+1)*block_size, :])
+
+    new_key = torch.cat(new_key, dim=-2)
+    new_value = torch.cat(new_value, dim=-2)
+    return new_key, new_value
 
 
 @torch.compiler.assume_constant_result
@@ -361,7 +391,7 @@ class UlyssesAttnMode(BaseTorchFunctionMode):
         if UlyssesAttnMode.disabled:
             return base_handle_torch_function(func, types, args, kwargs)
 
-        if func is F.scaled_dot_product_attention:
+        if func is F.scaled_dot_product_attention or func is self._attn_func:
             if self._skip_small_kv:
                 query, key = _get_args(args, kwargs, "query", "key")
                 if query.shape[-2] > key.shape[-2]:
@@ -446,23 +476,29 @@ class UnifiedAttnMode(BaseTorchFunctionMode):
         func = F.scaled_dot_product_attention
         parallel_method = self._parallel_method
         if parallel_method == "ulysses":
+            # print(f"ulysses attn mode")
             self._parallel_method = "ring"
             try:
                 with self:
                     if self._ulysses_mesh is None:
+                        # print(f"self._ulysses_mesh is None")
                         out = func(*args, **kwargs)
                     else:
-                        out = ulysses_attn_func(*args, **kwargs, mesh=self._ulysses_mesh)
+                        # print(f"self.ulysses_attn_func: {self._attn_func}")
+                        out = ulysses_attn_func(*args, **kwargs, mesh=self._ulysses_mesh, attn_func=self._attn_func)
             finally:
                 self._parallel_method = parallel_method
         elif parallel_method == "ring":
+            # print(f"ring attn mode")
             self._parallel_method = "none"
             try:
                 with self:
                     if self._ring_mesh is None:
                         out = func(*args, **kwargs)
+                        # print("ring mesh is None")
                     else:
                         out = ring_attn_func(*args, **kwargs, mesh=self._ring_mesh)
+                        # print("ring mesh is not None, calling ring_attn_func")
             finally:
                 self._parallel_method = parallel_method
         elif parallel_method == "none":
@@ -472,6 +508,7 @@ class UnifiedAttnMode(BaseTorchFunctionMode):
                 attn_func = self._attn_func
                 if attn_func is None:
                     attn_func = func
+                # print("none attn mode")
                 out = attn_func(*args, **kwargs)
         else:
             raise ValueError(f"Unknown parallel method: {parallel_method}")

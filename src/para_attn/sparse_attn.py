@@ -615,6 +615,8 @@ class SparseKVAttnMode(BaseTorchFunctionMode):
     def __torch_function__(self, func, types, args=(), kwargs=None):
         kwargs = {} if kwargs is None else kwargs
 
+        print(f"SparseKVAttnMode used")
+
         if SparseKVAttnMode.disabled:
             return base_handle_torch_function(func, types, args, kwargs)
 

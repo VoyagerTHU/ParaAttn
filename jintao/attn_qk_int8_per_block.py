@@ -18,7 +18,8 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len, current_flag,
                     frame_tokens: tl.constexpr = 1560,
                     sigmoid_a: tl.constexpr = 1.0,
                     alpha_xpos_xi: tl.constexpr = 0.9999967941742395,
-                    beta_xpos_xi: tl.constexpr = 0.9999860536252945
+                    beta_xpos_xi: tl.constexpr = 0.9999860536252945,
+                    text_false_length: tl.constexpr = 247,
                     ):
     DEFAULT=0
     XPOS=1
@@ -43,6 +44,12 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len, current_flag,
 
         if  current_flag == DEFAULT:
             qk = qk
+            # 修正条件判断：检查 n 是否大于 kv_len - 248
+            mask1 = n > (kv_len - text_false_length - 1)
+            # mask2 = m > (kv_len - text_flase_length - 1)
+            # mask1 = ((16838 < n) & (n < 16894)) | ((33723 < n) & (n < 33788)) | ((50617 < n) & (n < 50682)) | ((67511 < n) & (n < 67576))
+            # mask2 = m > (kv_len - 248)
+            qk = tl.where(mask1, -1e4, qk)
             
         if  current_flag == XPOS:
             dist    = tl.abs(m - n).to(tl.float32)             # |m-n|
@@ -123,7 +130,8 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out,
               frame_tokens: tl.constexpr = 1560,
               sigmoid_a: tl.constexpr = 1.0, 
               alpha_xpos_xi: tl.constexpr = 0.9999967941742395, 
-              beta_xpos_xi: tl.constexpr = 0.9999860536252945
+              beta_xpos_xi: tl.constexpr = 0.9999860536252945,
+              text_false_length: tl.constexpr = 247,
               ):
     start_m = tl.program_id(0)
 
@@ -161,7 +169,8 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out,
                                     frame_tokens=frame_tokens,
                                     sigmoid_a=sigmoid_a,
                                     alpha_xpos_xi=alpha_xpos_xi,
-                                    beta_xpos_xi=beta_xpos_xi
+                                    beta_xpos_xi=beta_xpos_xi,
+                                    text_false_length=text_false_length
                                     )
     acc = acc / l_i[:, None]
     tl.store(O_block_ptr, acc.to(Out.type.element_ty), mask = (offs_m[:, None] < qo_len))
@@ -171,7 +180,8 @@ def forward(q, k, v, flags, q_scale, k_scale, tensor_layout="HND", output_dtype=
               frame_tokens: tl.constexpr = 1560,
               sigmoid_a: tl.constexpr = 1.0, 
               alpha_xpos_xi: tl.constexpr = 0.9999967941742395, 
-              beta_xpos_xi: tl.constexpr = 0.9999860536252945):
+              beta_xpos_xi: tl.constexpr = 0.9999860536252945,
+              text_false_length: tl.constexpr = 247):
     BLOCK_M = 128
     BLOCK_N = 64
     stage = 1
@@ -221,6 +231,7 @@ def forward(q, k, v, flags, q_scale, k_scale, tensor_layout="HND", output_dtype=
         frame_tokens=frame_tokens,
         sigmoid_a=sigmoid_a, 
         alpha_xpos_xi=alpha_xpos_xi, 
-        beta_xpos_xi=beta_xpos_xi
+        beta_xpos_xi=beta_xpos_xi,
+        text_false_length=text_false_length
         )
     return o
