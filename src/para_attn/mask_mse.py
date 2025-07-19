@@ -143,6 +143,7 @@ def get_attention_mask(mask_name, sample_mse_max_row, context_length, num_frame,
     """
     
     full_size = context_length + num_frame * frame_size
+    # print(f"full_size: {full_size}")
     num_selected_rows = min(num_selected_rows, full_size)
     
     # Generate selected row indices using linspace
@@ -189,8 +190,7 @@ def get_attention_mask(mask_name, sample_mse_max_row, context_length, num_frame,
                         start_col =  j * block_size
                         end_col = min((j + 1) * block_size, full_size)
                         attention_mask[idx, start_col:end_col] = 1
-                
-            
+                        
     
     elif mask_name == "temporal":
         # # First Frame Sink for selected rows
@@ -309,7 +309,7 @@ def direct_threshold(query, key, value, attention_masks_narrow, attention_masks_
     sampled_attn_weights = F.softmax(sampled_qk_scores, dim=-1)
     # print(f"sampled_attn_weights: {sampled_attn_weights.shape}")
     
-    # 初始化flags为2（其他情况）
+    # 初始化flags为TEMPORAL（其他情况）
     flags = torch.full((cfg, num_heads), TEMPORAL, dtype=torch.long, device=query.device)
     
     # 检查narrow mask - use the indices within the mask

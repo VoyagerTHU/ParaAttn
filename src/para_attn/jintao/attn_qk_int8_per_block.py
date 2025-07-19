@@ -148,8 +148,7 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out,
               sigmoid_a: tl.constexpr = 1.0, 
               alpha_xpos_xi: tl.constexpr = 0.9999967941742395, 
               beta_xpos_xi: tl.constexpr = 0.9999860536252945,
-              text_false_length: tl.constexpr = 247,
-              ):
+              text_false_length: tl.constexpr = 247,):
     start_m = tl.program_id(0)
 
     off_z = tl.program_id(2).to(tl.int64)
@@ -249,6 +248,6 @@ def forward(q, k, v, flags, q_scale, k_scale, tensor_layout="HND", output_dtype=
         sigmoid_a=sigmoid_a, 
         alpha_xpos_xi=alpha_xpos_xi, 
         beta_xpos_xi=beta_xpos_xi,
-        text_false_length=text_false_length
+        text_false_length=text_false_length,
         )
     return o

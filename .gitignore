@@ -169,3 +169,5 @@ report*.html
 
 */__pycache__/*
 *.pyc
+*.pt
+/parallel_examples/Attention_patterns/*

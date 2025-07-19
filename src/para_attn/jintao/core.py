@@ -30,6 +30,7 @@ def jintao_sage(
     sigmoid_a: float = 1.0,
     alpha_xpos_xi: float = 0.97,
     beta_xpos_xi: float = 0.8,
+    frame_tokens: int = 1560,
     text_false_length: tl.constexpr = 247,
 ) -> torch.Tensor:
     """
@@ -123,6 +124,6 @@ def jintao_sage(
                        q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=dtype, 
                        xpos_xi=xpos_xi, sigmoid_a=sigmoid_a, 
                        alpha_xpos_xi=alpha_xpos_xi, beta_xpos_xi=beta_xpos_xi, 
-                       text_false_length=text_false_length)
+                       text_false_length=text_false_length, frame_tokens=frame_tokens)
 
     return o

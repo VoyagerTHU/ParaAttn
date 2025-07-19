@@ -108,7 +108,7 @@ def ulysses_attn_func(
     # new params
     attention_args=None,
     block_id=0,
-    time_step=0,
+    timestep=0,
     attention_type='original',
     method="thres",
     threshold_attn_args=None
@@ -176,7 +176,8 @@ def ulysses_attn_func(
                 is_causal=is_causal, sm_scale=scale, 
                 text_false_length=text_false_length,
                 alpha_xpos_xi = attention_args['alpha_xpos_xi'],
-                beta_xpos_xi = attention_args['beta_xpos_xi']
+                beta_xpos_xi = attention_args['beta_xpos_xi'],
+                frame_tokens = attention_args['frame_tokens']
             )
         elif attention_type == 'repeat':
             flags = (torch.ones((b, n), dtype=torch.long) * REPEAT).to(key.device)
@@ -186,10 +187,13 @@ def ulysses_attn_func(
                 text_false_length=text_false_length,
                 xpos_xi = attention_args['xpos_xi']
             )
-        elif attention_type == 'test-spatial-and-mid-xpos':
+        elif attention_type == 'pattern':
+            # print(f"block_id: {block_id}")
+            # print(f"timestep: {timestep}")
             flags = get_spatial_temporal_flag(query, key, value, 
                     attention_masks_narrow=threshold_attn_args['attention_masks_narrow'], 
                     attention_masks_wide=threshold_attn_args['attention_masks_wide'], 
+                    mask_selected_indices=threshold_attn_args['mask_selected_indices'],
                     method=method, 
                     num_sampled_rows=threshold_attn_args['num_sampled_rows'], 
                     threshold=threshold_attn_args['threshold'])
@@ -200,23 +204,29 @@ def ulysses_attn_func(
             if threshold_attn_args['one_time_ref'] == True:
                 # 获得当前在world中是第几个机器
                 rank = dist.get_rank()
-                savepath = f'{output_dir}/{sub_dir}/attention_patterns_{threshold_attn_args["threshold"]}/head_type_{block_id}_{rank}_{time_step.item()}'
+                savepath = f'{output_dir}/{sub_dir}/attention_patterns_{threshold_attn_args["threshold"]}/world_size_{world_size}/head_type_{block_id}_headbatch_{rank}_in_{world_size}_{timestep.item()}'
                 if threshold_attn_args['cfg'] == True:
-                    savepath = f'{output_dir}/{sub_dir}/attention_patterns_{threshold_attn_args["threshold"]}/head_type_cfg_{block_id}_{rank}_{time_step.item()}'
+                    savepath = f'{output_dir}/{sub_dir}/attention_patterns_{threshold_attn_args["threshold"]}/world_size_{world_size}/head_type_cfg_{block_id}_headbatch_{rank}_in_{world_size}_{timestep.item()}'
                 savepath = Path(savepath).with_suffix('.pt')
                 savepath.parent.mkdir(parents=True, exist_ok=True)
                 torch.save(flags, savepath)
             
-                x = attn_func(query, key, value, flags=flags, xpos_xi=threshold_attn_args['xi_for_XPOS'])
+                out = attn_func(query, key, value, flags=flags, 
+                                is_causal=is_causal, sm_scale=scale, 
+                                text_false_length=text_false_length,
+                                xpos_xi=threshold_attn_args['xi_for_XPOS'])
             else:
-                load_path = f'{output_dir}/{sub_dir}/attention_patterns_{threshold_attn_args["threshold"]}/head_type_{block_id}_{rank}_{time_step.item()}'
+                load_path = f'{output_dir}/{sub_dir}/attention_patterns_{threshold_attn_args["threshold"]}/world_size_{world_size}/head_type_{block_id}_headbatch_{rank}_in_{world_size}_{timestep.item()}'
                 if threshold_attn_args['cfg'] == True:
-                    load_path = f'{output_dir}/{sub_dir}/attention_patterns_{threshold_attn_args["threshold"]}/head_type_cfg_{block_id}_{rank}_{time_step.item()}'
+                    load_path = f'{output_dir}/{sub_dir}/attention_patterns_{threshold_attn_args["threshold"]}/world_size_{world_size}/head_type_cfg_{block_id}_headbatch_{rank}_in_{world_size}_{timestep.item()}'
                 load_path = Path(load_path).with_suffix('.pt')
                 flags = torch.load(load_path, map_location='cpu')
                 flags = flags.to(query.device)
             
-                x = attn_func(query, key, value, flags=flags, xpos_xi=threshold_attn_args['xi_for_XPOS'])
+                out = attn_func(query, key, value, flags=flags, 
+                                is_causal=is_causal, sm_scale=scale, 
+                                text_false_length=text_false_length,
+                                xpos_xi=threshold_attn_args['xi_for_XPOS'])
                 
         else:
             raise ValueError(f"Unknown attention type: {attention_type}")
@@ -476,20 +486,21 @@ class UlyssesAttnMode(BaseTorchFunctionMode):
     @torch.compiler.disable
     def __init__(self, mesh=None, *, attn_func=None, skip_small_kv=False,
                  attention_args=None,
-                 block_id=0,
-                 time_step=0,
+                 timestep=0,
                  attention_type='original',
-                 method="thres"
+                 method="thres",
+                 threshold_attn_args=None,
                  ):
         super().__init__()
         self._mesh = mesh
         self._attn_func = attn_func
         self._skip_small_kv = skip_small_kv
         self._attention_args = attention_args
-        self._block_id = block_id
-        self._time_step = time_step
+        self._block_id = 0
+        self._timestep = timestep
         self._attention_type = attention_type
         self._method = method
+        self._threshold_attn_args = threshold_attn_args
 
     def __torch_function__(self, func, types, args=(), kwargs=None):
         kwargs = {} if kwargs is None else kwargs
@@ -509,16 +520,18 @@ class UlyssesAttnMode(BaseTorchFunctionMode):
     def _call_ulysses_attn_func(self, *args, **kwargs):
         mesh = self._mesh
         attn_func = self._attn_func
+        self._block_id += 1
         return ulysses_attn_func(
             *args, 
             **kwargs, 
             mesh=mesh, 
             attn_func=attn_func,
             attention_args=self._attention_args,
-            block_id=self._block_id,
-            time_step=self._time_step,
+            block_id=self._block_id - 1,
+            timestep=self._timestep,
             attention_type=self._attention_type,
-            method=self._method
+            method=self._method,
+            threshold_attn_args=self._threshold_attn_args,
         )
 
     @classmethod

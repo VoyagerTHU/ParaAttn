@@ -26,9 +26,9 @@ def parallelize_transformer(
         mesh=None, 
         new_attention=None,
         attention_args=None,
-        block_id=0, time_step=0,
         attention_type='original',
-        method="thres"
+        method="thres",
+        threshold_attn_args=None,
     ):
     if getattr(transformer, "_is_parallelized", False):
         return transformer
@@ -74,6 +74,7 @@ def parallelize_transformer(
 
         # 2. Conditional embeddings
         temb = self.time_text_embed(timestep, guidance, pooled_projections)
+        # print(f"temb: {temb.shape}")
         hidden_states = self.x_embedder(hidden_states)
         encoder_hidden_states = self.context_embedder(encoder_hidden_states, timestep, encoder_attention_mask)
 
@@ -136,10 +137,10 @@ def parallelize_transformer(
                 ulysses_mesh, 
                 attn_func=new_attention,
                 attention_args=attention_args,
-                block_id=block_id,
-                time_step=time_step,
+                timestep=timestep,
                 attention_type=attention_type,
-                method=method
+                method=method,
+                threshold_attn_args=threshold_attn_args,
             ):
             # 4. Transformer blocks
             hidden_states, encoder_hidden_states = self.call_transformer_blocks(
