@@ -15,12 +15,21 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 # 修改导入路径，使用同级文件夹的 jintao 中的 sageattn
 import sys
 import os
-sys.path.append("/mnt/vepfs/base2/chenyixiao/yingze/ParaAttention")
-from jintao import jintao_sage
+# sys.path.append("/mnt/vepfs/base2/chenyixiao/yingze/ParaAttention")
+# from jintao import jintao_sage
 import torch.nn.functional as F
 
 
-def parallelize_transformer(transformer: HunyuanVideoTransformer3DModel, *, mesh=None):
+def parallelize_transformer(
+        transformer: HunyuanVideoTransformer3DModel, 
+        *, 
+        mesh=None, 
+        new_attention=None,
+        attention_args=None,
+        block_id=0, time_step=0,
+        attention_type='original',
+        method="thres"
+    ):
     if getattr(transformer, "_is_parallelized", False):
         return transformer
 
@@ -123,7 +132,15 @@ def parallelize_transformer(transformer: HunyuanVideoTransformer3DModel, *, mesh
 
         ulysses_mesh = mesh["ulysses"]
 
-        with UlyssesAttnMode(ulysses_mesh, attn_func=F.scaled_dot_product_attention):
+        with UlyssesAttnMode(
+                ulysses_mesh, 
+                attn_func=new_attention,
+                attention_args=attention_args,
+                block_id=block_id,
+                time_step=time_step,
+                attention_type=attention_type,
+                method=method
+            ):
             # 4. Transformer blocks
             hidden_states, encoder_hidden_states = self.call_transformer_blocks(
                 hidden_states, encoder_hidden_states, temb, attention_mask, image_rotary_emb

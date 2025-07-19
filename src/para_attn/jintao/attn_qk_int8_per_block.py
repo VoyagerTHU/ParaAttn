@@ -28,6 +28,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len, current_flag,
     SPATIAL=4
     MID=5
     TEMPORAL=6
+    REPEAT=7
     
     LOG2_XPOS = tl.log2(tl.full((), xpos_xi, dtype=tl.float32))
     lo, hi = 0, kv_len
@@ -42,19 +43,35 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len, current_flag,
         
         qk = tl.dot(q, k).to(tl.float32) * q_scale * k_scale
 
+        # 修正条件判断：检查 n 是否大于 kv_len - 248
+        mask1 = n > (kv_len - text_false_length - 1)
+        mask2 = m > (kv_len - text_false_length - 1)
+        # mask1 = ((16838 < n) & (n < 16894)) | ((33723 < n) & (n < 33788)) | ((50617 < n) & (n < 50682)) | ((67511 < n) & (n < 67576))
+        # mask2 = m > (kv_len - 248)
+        qk = tl.where(mask1 | mask2, -1e4, qk)
+
+        mask3 = (kv_len - n > 256) & (kv_len - m > 256)
         if  current_flag == DEFAULT:
             qk = qk
-            # 修正条件判断：检查 n 是否大于 kv_len - 248
-            mask1 = n > (kv_len - text_false_length - 1)
-            # mask2 = m > (kv_len - text_flase_length - 1)
-            # mask1 = ((16838 < n) & (n < 16894)) | ((33723 < n) & (n < 33788)) | ((50617 < n) & (n < 50682)) | ((67511 < n) & (n < 67576))
-            # mask2 = m > (kv_len - 248)
-            qk = tl.where(mask1, -1e4, qk)
             
         if  current_flag == XPOS:
             dist    = tl.abs(m - n).to(tl.float32)             # |m-n|
-            xpos_pow = tl.math.exp2(dist * LOG2_XPOS)          # xi^{|m-n|}
-            qk *= xpos_pow
+            xpos_pow = tl.math.exp2(dist * LOG2_XPOS)   
+            qk = tl.where(mask3, qk*xpos_pow, qk)
+
+        if current_flag == REPEAT:
+
+            dist    = tl.abs(m - n).to(tl.float32)             # |m-n|
+            xpos_pow = tl.math.exp2(dist * LOG2_XPOS)   
+            
+            
+            STEP = tl.constexpr(544 * 960 // 16 // 16)  # 2040
+            dist_i = tl.abs(m - n).to(tl.int32)
+            bad = ((dist_i >= 46 * STEP) & (dist_i <= 54 * STEP)) | \
+                ((dist_i >= 96 * STEP) & (dist_i <= 104 * STEP))
+            
+            qk = tl.where(mask3, qk*xpos_pow, qk)
+            qk = tl.where(bad & mask3, -1e4, qk)
             
         # if current_flag==TEMPORAL:#current_flag == SPATIAL or current_flag == MID:
         #     dist    = tl.abs(m - n).to(tl.float32)             # |m-n|
@@ -67,7 +84,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len, current_flag,
             # tl.device_assert(kv_len == 32000 * 4, "kv_len must be 32000 * 4")
             rela_dist = dist / (kv_len / 4)
             sigmoid_pow = (1 / (1 + tl.math.exp(sigmoid_a_val * (rela_dist - 1))) + 0.5) * 0.34 + 0.5
-            qk *= sigmoid_pow
+            qk = tl.where(mask3, qk*sigmoid_pow, qk)
 
         if current_flag == INTERPOLATION:
             # 使用预计算的常数
@@ -92,7 +109,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len, current_flag,
             
             # 插值计算
             xpos_pow = interp_factor * alpha_xpos_pow + (1 - interp_factor) * beta_xpos_pow
-            qk *= xpos_pow
+            qk = tl.where(mask3, qk*xpos_pow, qk)
         
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
         qk = qk - m_ij[:, None]
