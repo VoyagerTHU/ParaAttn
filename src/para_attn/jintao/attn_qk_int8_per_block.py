@@ -29,6 +29,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len, current_flag,
     MID=5
     TEMPORAL=6
     REPEAT=7
+    REPEAT_INTERPOLATION=8
     
     LOG2_XPOS = tl.log2(tl.full((), xpos_xi, dtype=tl.float32))
     lo, hi = 0, kv_len
@@ -110,6 +111,44 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len, current_flag,
             # 插值计算
             xpos_pow = interp_factor * alpha_xpos_pow + (1 - interp_factor) * beta_xpos_pow
             qk = tl.where(mask3, qk*xpos_pow, qk)
+        
+        if current_flag == REPEAT_INTERPOLATION:
+            dist    = tl.abs(m - n).to(tl.float32)             # |m-n|
+            # xpos_pow = tl.math.exp2(dist * LOG2_XPOS)   
+            
+            STEP = tl.constexpr(544 * 960 // 16 // 16)  # 2040
+            dist_i = tl.abs(m - n).to(tl.int32)
+            bad = ((dist_i >= 46 * STEP) & (dist_i <= 54 * STEP)) | \
+                ((dist_i >= 96 * STEP) & (dist_i <= 104 * STEP))
+            
+            # qk = tl.where(mask3, qk*xpos_pow, qk)
+
+            # 使用预计算的常数
+            alpha_log = tl.log2(tl.full((), alpha_xpos_xi, dtype=tl.float32))
+            beta_log = tl.log2(tl.full((), beta_xpos_xi, dtype=tl.float32))
+            
+            # 计算帧内位置 - 修复tl.full_like错误
+            frame_tokens_scalar = tl.full((), frame_tokens, dtype=tl.float32)
+            n_pos_within_frame = n % frame_tokens_scalar
+            half_frame = frame_tokens_scalar / 2
+            
+            # 使用tl.where避免分支divergence
+            mask = n_pos_within_frame < half_frame
+            factor1 = 1 - n_pos_within_frame / half_frame
+            factor2 = (n_pos_within_frame - half_frame) / half_frame
+            interp_factor = tl.where(mask, factor1, factor2)
+            
+            # 计算距离和幂次
+            dist = tl.abs(m - n).to(tl.float32)
+            alpha_xpos_pow = tl.math.exp2(dist * alpha_log)
+            beta_xpos_pow = tl.math.exp2(dist * beta_log)
+            
+            # 插值计算
+            xpos_pow = interp_factor * alpha_xpos_pow + (1 - interp_factor) * beta_xpos_pow
+            qk = tl.where(mask3, qk*xpos_pow, qk)
+            
+            qk = tl.where(bad & mask3, -1e4, qk)
+        
         
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
         qk = qk - m_ij[:, None]

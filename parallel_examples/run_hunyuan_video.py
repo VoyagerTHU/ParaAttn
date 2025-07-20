@@ -70,13 +70,13 @@ lis = [
     'An animated character with white hair and a muscular build is shown in a close-up, displaying a stern and intense expression. The character is dressed in a red and gold outfit, suggesting a regal or powerful status. The scene transitions to reveal the character seated on a throne-like structure with ornate decorations, addressing a group of people who are standing in front of it. The atmosphere is serious and charged with emotion, indicating a moment of significance or decision-making. The camera focuses on the character\'s face before widening the shot to include the character\'s interaction with the group, using fixed position shots without any discernible camera movement. The visual style is characteristic of Japanese anime, with detailed character designs and vibrant coloring.'
 ]
 
-num_frames = 129
+num_frames = 393
 if num_frames == 129:
     one_time_ref = True
 else:
     one_time_ref = False
 
-attention_type = 'pattern'
+attention_type = 'repeat_interpolation'
 method = 'thres'
 
 sample_mse_max_row = 64
@@ -86,8 +86,8 @@ wide_width = 2
 threshold = 0.5
 prompt_name = '_'.join(lis[0].split(' ')[0:3])
 
-alpha = 0.97
-beta = 0.95
+alpha = 0.95
+beta = 0.90
 xpos = 0.95
 xpos_xi = xpos**(1/16000)
 sigmoid_a = 1.0
@@ -202,6 +202,8 @@ if dist.get_rank() == 0:
         filename = f"hunyuan_video_interpolation_{alpha}_{beta}_{num_frames}.mp4"
     elif attention_type == 'pattern':
         filename = f"hunyuan_video_pattern_{threshold}_{xpos}_{num_frames}.mp4"
+    elif attention_type == 'repeat_interpolation':
+        filename = f"hunyuan_video_repeat_interpolation_{alpha}_{beta}_{num_frames}.mp4"
     else:
         raise ValueError(f"Invalid attention type: {attention_type}")
     export_to_video(output, os.path.join(output_dir, filename), fps=24)
