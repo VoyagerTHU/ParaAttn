@@ -132,13 +132,9 @@ def get_filename(attention_type, params, num_frames):
     else:
         raise ValueError(f"Invalid attention type: {attention_type}")
 
-def run_experiment(config):
+def run_experiment(config, pipe):
     """运行单个实验"""
     try:
-        # 初始化
-        init_distributed()
-        pipe = load_model()
-        
         # 设置参数
         attention_type = config['attention_type']
         num_frames = config['num_frames']
@@ -233,7 +229,8 @@ def run_experiment(config):
             print(f"Error in experiment: {e}")
         return False
     finally:
-        dist.destroy_process_group()
+        pass
+        # dist.destroy_process_group()
 
 def main():
     """主函数"""
@@ -315,7 +312,7 @@ def main():
             'alpha': alpha,
             'beta': beta,
             'prompt': prompts[0],
-            'num_frames': 129,
+            'num_frames': 393,
         })
     
     # # 6. Pattern attention with different thresholds
@@ -343,6 +340,10 @@ def main():
     
     # 运行所有实验
     print(f"Total experiments to run: {len(experiments)}")
+
+    # 初始化
+    init_distributed()
+    pipe = load_model()
     
     for i, config in enumerate(experiments):
         print(f"\n{'='*50}")
@@ -351,7 +352,7 @@ def main():
         print(f"Parameters: {config}")
         print(f"{'='*50}")
         
-        success = run_experiment(config)
+        success = run_experiment(config, pipe)
         
         if success:
             print(f"Experiment {i+1} completed successfully")
