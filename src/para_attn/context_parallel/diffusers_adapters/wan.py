@@ -14,10 +14,18 @@ from para_attn.para_attn_interface import UnifiedAttnMode
 logger = logging.get_logger(__name__)
 
 
-def parallelize_transformer(transformer: WanTransformer3DModel, *, mesh=None):
+def parallelize_transformer(
+        transformer: WanTransformer3DModel, 
+        *, 
+        mesh=None, 
+        new_attention=None,
+        attention_args=None,
+        attention_type='original',
+        method="thres",
+        threshold_attn_args=None,
+    ):
     if getattr(transformer, "_is_parallelized", False):
         return transformer
-
     mesh = init_context_parallel_mesh(transformer.device.type, mesh=mesh)
     batch_mesh = mesh["batch"]
     seq_mesh = mesh["ring", "ulysses"]._flatten()

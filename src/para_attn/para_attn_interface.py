@@ -193,7 +193,6 @@ def ulysses_attn_func(
                 query, key, value, flags=flags, 
                 is_causal=is_causal, sm_scale=scale, 
                 text_false_length=text_false_length,
-                xpos_xi = attention_args['xpos_xi'],
                 alpha_xpos_xi = attention_args['alpha_xpos_xi'],
                 beta_xpos_xi = attention_args['beta_xpos_xi'],
                 frame_tokens = attention_args['frame_tokens']

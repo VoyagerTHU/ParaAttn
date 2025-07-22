@@ -16,6 +16,7 @@ from jintao.core import jintao_sage
 from para_attn.context_parallel import init_context_parallel_mesh
 from para_attn.context_parallel.diffusers_adapters import parallelize_pipe
 from para_attn.parallel_vae.diffusers_adapters import parallelize_vae
+import gc
 
 def init_distributed():
     """初始化分布式环境"""
@@ -135,6 +136,7 @@ def get_filename(attention_type, params, num_frames):
 def run_experiment(config, pipe):
     """运行单个实验"""
     try:
+        # init_distributed()
         # 设置参数
         attention_type = config['attention_type']
         num_frames = config['num_frames']
@@ -305,15 +307,15 @@ def main():
         (1.00, 0.90),
         (1.00, 0.85),
     ]
-    for alpha, beta in alpha_beta_combinations:
-        experiments.append({
-            **base_config,
-            'attention_type': 'interpolation',
-            'alpha': alpha,
-            'beta': beta,
-            'prompt': prompts[0],
-            'num_frames': 393,
-        })
+    # for alpha, beta in alpha_beta_combinations:
+    #     experiments.append({
+    #         **base_config,
+    #         'attention_type': 'interpolation',
+    #         'alpha': alpha,
+    #         'beta': beta,
+    #         'prompt': prompts[0],
+    #         'num_frames': 393,
+    #     })
     
     # # 6. Pattern attention with different thresholds
     # threshold_values = [0.3, 0.5, 0.7]
@@ -343,7 +345,7 @@ def main():
 
     # 初始化
     init_distributed()
-    pipe = load_model()
+    # pipe = load_model()
     
     for i, config in enumerate(experiments):
         print(f"\n{'='*50}")
@@ -352,7 +354,11 @@ def main():
         print(f"Parameters: {config}")
         print(f"{'='*50}")
         
+        # init_distributed()
+        pipe = load_model()
         success = run_experiment(config, pipe)
+        del pipe
+        gc.collect()  # 强制垃圾回收
         
         if success:
             print(f"Experiment {i+1} completed successfully")

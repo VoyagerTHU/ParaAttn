@@ -1,0 +1,16 @@
+{
+  "height": 544,
+  "width": 960,
+  "num_inference_steps": 50,
+  "generator_seed": 42,
+  "sample_mse_max_row": 64,
+  "context_length": 256,
+  "narrow_width": 1,
+  "wide_width": 2,
+  "sigmoid_a": 1.0,
+  "attention_type": "repeat_interpolation",
+  "alpha": 0.9,
+  "beta": 0.85,
+  "prompt": "An animated porcupine with a mix of brown and white fur and prominent quills is seen in a cozy, warmly lit interior setting, interacting with a green gift box with a yellow ribbon. The room is filled with wooden furniture and colorful wall decorations, suggesting a cheerful and domestic atmosphere. The porcupine's large eyes and expressive face convey a sense of lightheartedness and curiosity. The camera maintains a low angle, close to the ground, providing an intimate view of the character's actions without any movement, focusing on the playful and curious mood of the scene. The visual style is characteristic of contemporary 3D animation, with vibrant colors and smooth textures that create a polished and engaging look. The scene transitions to an outdoor environment, showcasing a sunny, verdant landscape with rocks, trees, and grass, indicating a natural, possibly forest-like setting. The presence of a small character in the final frame suggests the continuation of a narrative or the introduction of new characters.",
+  "num_frames": 393
+}
