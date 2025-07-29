@@ -12,7 +12,7 @@ from datetime import datetime
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 import para_attn
-from jintao.core import jintao_sage
+from para_attn.jintao.core import jintao_sage
 from para_attn.context_parallel import init_context_parallel_mesh
 from para_attn.context_parallel.diffusers_adapters import parallelize_pipe
 from para_attn.parallel_vae.diffusers_adapters import parallelize_vae
@@ -73,7 +73,7 @@ def get_attention_masks(attention_type, sample_mse_max_row, context_length, num_
     
     return attention_masks_narrow, attention_masks_wide, mask_selected_indices
 
-def parallelize_model(pipe, mesh, attention_type, attention_args, threshold_attn_args):
+def parallelize_model(pipe, mesh, attention_type, attention_args, threshold_attn_args, sink_args):
     """并行化模型"""
     parallelize_pipe(
         pipe,
@@ -83,6 +83,7 @@ def parallelize_model(pipe, mesh, attention_type, attention_args, threshold_attn
         attention_type=attention_type,
         method='thres',
         threshold_attn_args=threshold_attn_args,
+        sink_args=sink_args,
     )
     parallelize_vae(pipe.vae, mesh=mesh._flatten())
 
@@ -130,109 +131,123 @@ def get_filename(attention_type, params, num_frames):
         alpha = params.get('alpha', 0.95)
         beta = params.get('beta', 0.90)
         return f"hunyuan_video_repeat_interpolation_{alpha}_{beta}_{num_frames}.mp4"
+    elif attention_type == 'sink':
+        alpha_xpos_xi = params.get('alpha_xpos_xi', 1.00)
+        beta_xpos_xi = params.get('beta_xpos_xi', 0.95)
+        sink_width = params.get('sink_width', 4)
+        window_width = params.get('window_width', 16)
+        return f"hunyuan_video_sink_{alpha_xpos_xi}_{beta_xpos_xi}_{sink_width}_{window_width}_{num_frames}.mp4"
     else:
         raise ValueError(f"Invalid attention type: {attention_type}")
 
 def run_experiment(config, pipe):
     """运行单个实验"""
-    try:
-        # init_distributed()
-        # 设置参数
-        attention_type = config['attention_type']
-        num_frames = config['num_frames']
-        height = config['height']
-        width = config['width']
-        prompt = config['prompt']
-        num_inference_steps = config['num_inference_steps']
-        generator_seed = config['generator_seed']
-        
-        # 计算frame_size
-        frame_size = (height // 16) * (width // 16)
-        
-        # 获取attention masks
-        attention_masks_narrow = None
-        attention_masks_wide = None
-        mask_selected_indices = None
-        threshold_attn_args = None
-        if attention_type in ['pattern']:
-            attention_masks_narrow, attention_masks_wide, mask_selected_indices = get_attention_masks(
-                attention_type, 
-                config['sample_mse_max_row'], 
-                config['context_length'], 
-                num_frames, 
-                frame_size, 
-                config['narrow_width'], 
-                config['wide_width']
-            )
-            # 设置threshold参数
-            threshold_attn_args = {
-                'threshold': config['threshold'],
-                'one_time_ref': num_frames == 129,
-                'mask_selected_indices': mask_selected_indices,
-                'attention_masks_narrow': attention_masks_narrow,
-                'attention_masks_wide': attention_masks_wide,
-                'num_sampled_rows': config['sample_mse_max_row'],
-                'sub_dir': '_'.join(prompt.split(' ')[0:3]),
-                'cfg': True,
-                'xi_for_XPOS': 0.9999934149894527,
-            }
-        
-        # 设置attention参数
-        attention_args = {
-            'frame_tokens': 2040,
+    # try:
+    # init_distributed()
+    # 设置参数
+    attention_type = config['attention_type']
+    num_frames = config['num_frames']
+    height = config['height']
+    width = config['width']
+    prompt = config['prompt']
+    num_inference_steps = config['num_inference_steps']
+    generator_seed = config['generator_seed']
+    
+    # 计算frame_size
+    frame_size = (height // 16) * (width // 16)
+    
+    # 获取attention masks
+    attention_masks_narrow = None
+    attention_masks_wide = None
+    mask_selected_indices = None
+    threshold_attn_args = None
+    if attention_type in ['pattern']:
+        attention_masks_narrow, attention_masks_wide, mask_selected_indices = get_attention_masks(
+            attention_type, 
+            config['sample_mse_max_row'], 
+            config['context_length'], 
+            num_frames, 
+            frame_size, 
+            config['narrow_width'], 
+            config['wide_width']
+        )
+        # 设置threshold参数
+        threshold_attn_args = {
+            'threshold': config['threshold'],
+            'one_time_ref': num_frames == 129,
+            'mask_selected_indices': mask_selected_indices,
+            'attention_masks_narrow': attention_masks_narrow,
+            'attention_masks_wide': attention_masks_wide,
+            'num_sampled_rows': config['sample_mse_max_row'],
+            'sub_dir': '_'.join(prompt.split(' ')[0:3]),
+            'cfg': True,
+            'xi_for_XPOS': 0.9999934149894527,
         }
+    
+    # 设置attention参数
+    attention_args = {
+        'frame_tokens': 2040,
+    }
+    
+    # 根据attention_type添加特定参数
+    if attention_type in ['XPOS', 'pattern']:
+        xpos = config['xpos']
+        attention_args.update({
+            'xpos_xi': xpos**(1/16000),
+            'sigmoid_a': config['sigmoid_a'],
+        })
+    
+    if attention_type in ['interpolation', 'repeat_interpolation']:
+        alpha = config['alpha']
+        beta = config['beta']
+        attention_args.update({
+            'alpha_xpos_xi': float(alpha)**(1/16000),
+            'beta_xpos_xi': float(beta)**(1/16000),
+        })
+
+    if attention_type in ['sink']:
+        sink_args = {
+            'sink_width': config['sink_width'],
+            'window_width': config['window_width'],
+            'alpha_xpos_xi': config['alpha_xpos_xi'],
+            'beta_xpos_xi': config['beta_xpos_xi'],
+        }
+    
+    
+    # 初始化mesh
+    mesh = init_context_parallel_mesh(pipe.device.type)
+    
+    # 并行化模型
+    parallelize_model(pipe, mesh, attention_type, attention_args, threshold_attn_args, sink_args)
+    
+    # 启用VAE tiling
+    pipe.vae.enable_tiling()
+    
+    # 生成视频
+    output = generate_video(pipe, prompt, height, width, num_frames, num_inference_steps, generator_seed)
+    
+    # 保存视频
+    prompt_name = '_'.join(prompt.split(' ')[0:10])
+    output_dir = f"output_videos_new/{prompt_name}/{attention_type}"
+    filename = get_filename(attention_type, config, num_frames)
+    save_video(output, output_dir, filename)
+    
+    # 保存配置
+    if dist.get_rank() == 0:
+        config_file = os.path.join(output_dir, f"config_{filename.replace('.mp4', '.json')}")
+        with open(config_file, 'w') as f:
+            json.dump(config, f, indent=2)
+        print(f"Config saved to: {config_file}")
+    
+    return True
         
-        # 根据attention_type添加特定参数
-        if attention_type in ['XPOS', 'pattern']:
-            xpos = config['xpos']
-            attention_args.update({
-                'xpos_xi': xpos**(1/16000),
-                'sigmoid_a': config['sigmoid_a'],
-            })
-        
-        if attention_type in ['interpolation', 'repeat_interpolation']:
-            alpha = config['alpha']
-            beta = config['beta']
-            attention_args.update({
-                'alpha_xpos_xi': float(alpha)**(1/16000),
-                'beta_xpos_xi': float(beta)**(1/16000),
-            })
-        
-        
-        # 初始化mesh
-        mesh = init_context_parallel_mesh(pipe.device.type)
-        
-        # 并行化模型
-        parallelize_model(pipe, mesh, attention_type, attention_args, threshold_attn_args)
-        
-        # 启用VAE tiling
-        pipe.vae.enable_tiling()
-        
-        # 生成视频
-        output = generate_video(pipe, prompt, height, width, num_frames, num_inference_steps, generator_seed)
-        
-        # 保存视频
-        prompt_name = '_'.join(prompt.split(' ')[0:3])
-        output_dir = f"output_videos_new/{prompt_name}/{attention_type}"
-        filename = get_filename(attention_type, config, num_frames)
-        save_video(output, output_dir, filename)
-        
-        # 保存配置
-        if dist.get_rank() == 0:
-            config_file = os.path.join(output_dir, f"config_{filename.replace('.mp4', '.json')}")
-            with open(config_file, 'w') as f:
-                json.dump(config, f, indent=2)
-            print(f"Config saved to: {config_file}")
-        
-        return True
-        
-    except Exception as e:
-        if dist.get_rank() == 0:
-            print(f"Error in experiment: {e}")
-        return False
-    finally:
-        pass
-        # dist.destroy_process_group()
+    # except Exception as e:
+    #     if dist.get_rank() == 0:
+    #         print(f"Error in experiment: {e}")
+    #     return False
+    # finally:
+    #     pass
+    #     # dist.destroy_process_group()
 
 def main():
     """主函数"""
@@ -251,8 +266,12 @@ def main():
     
     # 提示词列表
     prompts = [
+        # 'An animated porcupine with a mix of brown and white fur and prominent quills is seen in a cozy, warmly lit interior setting, interacting with a green gift box with a yellow ribbon. The room is filled with wooden furniture and colorful wall decorations, suggesting a cheerful and domestic atmosphere. The porcupine\'s large eyes and expressive face convey a sense of lightheartedness and curiosity. The camera maintains a low angle, close to the ground, providing an intimate view of the character\'s actions without any movement, focusing on the playful and curious mood of the scene. The visual style is characteristic of contemporary 3D animation, with vibrant colors and smooth textures that create a polished and engaging look. The scene transitions to an outdoor environment, showcasing a sunny, verdant landscape with rocks, trees, and grass, indicating a natural, possibly forest-like setting. The presence of a small character in the final frame suggests the continuation of a narrative or the introduction of new characters.',
+        # 'Animated characters, a rabbit and a mouse, are depicted in a perilous situation, first plummeting through a dark, undefined space, and then floating and swimming in a serene underwater environment. The characters are dressed in adventure gear, suggesting a narrative context. The camera closely follows their expressions and movements, capturing the tension and urgency of their situation. The medium and close-up shots emphasize their facial expressions, which convey fear and determination. The visual style is high-quality 3D animation with detailed textures and lighting, creating a cinematic feel.',
+        # 'Animated characters, a rabbit and a mouse, are depicted in a perilous situation, first plummeting through a dark, undefined space, and then floating and swimming in a serene underwater environment. The characters are dressed in adventure gear, suggesting a narrative context. The camera closely follows their expressions and movements, capturing the tension and urgency of their situation. The medium and close-up shots emphasize their facial expressions, which convey fear and determination. The visual style is high-quality 3D animation with detailed textures and lighting, creating a cinematic feel.',
         'An animated porcupine with a mix of brown and white fur and prominent quills is seen in a cozy, warmly lit interior setting, interacting with a green gift box with a yellow ribbon. The room is filled with wooden furniture and colorful wall decorations, suggesting a cheerful and domestic atmosphere. The porcupine\'s large eyes and expressive face convey a sense of lightheartedness and curiosity. The camera maintains a low angle, close to the ground, providing an intimate view of the character\'s actions without any movement, focusing on the playful and curious mood of the scene. The visual style is characteristic of contemporary 3D animation, with vibrant colors and smooth textures that create a polished and engaging look. The scene transitions to an outdoor environment, showcasing a sunny, verdant landscape with rocks, trees, and grass, indicating a natural, possibly forest-like setting. The presence of a small character in the final frame suggests the continuation of a narrative or the introduction of new characters.',
-        'Animated characters, a rabbit and a mouse, are depicted in a perilous situation, first plummeting through a dark, undefined space, and then floating and swimming in a serene underwater environment. The characters are dressed in adventure gear, suggesting a narrative context. The camera closely follows their expressions and movements, capturing the tension and urgency of their situation. The medium and close-up shots emphasize their facial expressions, which convey fear and determination. The visual style is high-quality 3D animation with detailed textures and lighting, creating a cinematic feel.',
+        # 'Animated characters are engaging in a magical interaction within a dark, cavernous environment. The scene centers on a small, orange magical creature with a glowing heart, as well as two dragon-like creatures, one of which is holding a magical potion. The creature opens the potion, causing a transformation, which captures the attention of the dragons. Subsequently, two human characters with a torch discover the aftermath of the transformation, revealing a small, glowing creature resembling the one from earlier. The atmosphere is whimsical and magical, with a sense of curiosity and discovery. The camera remains static, offering medium shots that focus on the characters and their actions, while the visual style is traditional animation with smooth lines and vibrant colors.',
+        # 'A man with facial hair, dressed in a burgundy shirt, is seen knocking on a weathered wooden door with a metal latch and a small window, set in a stone wall. The scene transitions to an indoor setting where the man, now wearing a blue shirt, speaks to the camera in a well-lit room furnished with a couch, a bookshelf, and various decorations. The video captures the man in a medium shot with a stationary camera, conveying a casual and friendly atmosphere in the indoor scene, contrasted with a neutral atmosphere in the outdoor scene. The visual style is realistic with natural lighting and color grading.'
     ]
     
     # 实验配置列表
@@ -300,12 +319,12 @@ def main():
     
     # 5. Interpolation attention with different alpha/beta combinations
     alpha_beta_combinations = [
-        (0.90, 0.85),
-        (0.95, 0.90),
-        (0.99, 0.95),
+        # (0.90, 0.85),
+        # (0.95, 0.90),
+        # (0.99, 0.95),
         (1.00, 0.95),
-        (1.00, 0.90),
-        (1.00, 0.85),
+        # (1.00, 0.90),
+        # (1.00, 0.85),
     ]
     # for alpha, beta in alpha_beta_combinations:
     #     experiments.append({
@@ -329,16 +348,32 @@ def main():
     #         'num_frames': 393,
     #     })
     
-    # 7. Repeat interpolation with different alpha/beta combinations
-    for alpha, beta in alpha_beta_combinations:
-        experiments.append({
-            **base_config,
-            'attention_type': 'repeat_interpolation',
-            'alpha': alpha,
-            'beta': beta,
-            'prompt': prompts[0],
-            'num_frames': 393,
-        })
+    # # 7. Repeat interpolation with different alpha/beta combinations
+    # for prompt in prompts:
+    #     for alpha, beta in alpha_beta_combinations:
+    #         experiments.append({
+    #             **base_config,
+    #             'attention_type': 'interpolation',
+    #             'alpha': alpha,
+    #             'beta': beta,
+    #             'prompt': prompt,
+    #             'num_frames': 393,
+    #         })
+
+    # 8. sink 
+    for prompt in prompts:
+        for sink_width in [4, 1, 0]:
+            for window_width in [33]:
+                experiments.append({
+                    **base_config,
+                    'attention_type': 'sink',
+                    'prompt': prompt,
+                    'num_frames': 393,
+                    'sink_width': sink_width,
+                    'window_width': window_width,
+                    'alpha_xpos_xi': 1.00,
+                    'beta_xpos_xi': 0.95,
+                })
     
     # 运行所有实验
     print(f"Total experiments to run: {len(experiments)}")

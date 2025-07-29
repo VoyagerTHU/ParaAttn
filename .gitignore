@@ -171,3 +171,4 @@ report*.html
 *.pyc
 *.pt
 /parallel_examples/Attention_patterns/*
+*.json

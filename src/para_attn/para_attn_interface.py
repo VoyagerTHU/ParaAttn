@@ -37,7 +37,7 @@ try:
 except ImportError:
     torch_ring_attention = None
 
-from sageattention import sageattn
+# from sageattention import sageattn
 
 __all__ = [
     "UnifiedAttnMode",
@@ -111,7 +111,8 @@ def ulysses_attn_func(
     timestep=0,
     attention_type='original',
     method="thres",
-    threshold_attn_args=None
+    threshold_attn_args=None,
+    sink_args=None
 ):
     assert query.ndim == 4, "query must have 4 dimensions, got {}".format(query.ndim)
     assert key.ndim == 4, "key must have 4 dimensions, got {}".format(key.ndim)
@@ -237,7 +238,21 @@ def ulysses_attn_func(
                                 is_causal=is_causal, sm_scale=scale, 
                                 text_false_length=text_false_length,
                                 xpos_xi=threshold_attn_args['xi_for_XPOS'])
-                
+        elif attention_type == 'sink':
+            flags = (torch.ones((b, n), dtype=torch.long) * SINK).to(key.device)
+            if sink_args['sink_width'] is None:
+                raise ValueError("sink_width is not provided")
+            if sink_args['window_width'] is None:
+                raise ValueError("window_width is not provided")
+            out = attn_func(query, key, value, flags=flags, 
+                            is_causal=is_causal, sm_scale=scale, 
+                            text_false_length=text_false_length,
+                            alpha_xpos_xi=sink_args['alpha_xpos_xi'],
+                            beta_xpos_xi=sink_args['beta_xpos_xi'],
+                            sink_width=sink_args['sink_width'],
+                            window_width=sink_args['window_width'],
+                            frame_tokens=attention_args['frame_tokens']
+                            )
         else:
             raise ValueError(f"Unknown attention type: {attention_type}")
     out = _sdpa_output_all_to_all(out, mesh)
@@ -500,6 +515,7 @@ class UlyssesAttnMode(BaseTorchFunctionMode):
                  attention_type='original',
                  method="thres",
                  threshold_attn_args=None,
+                 sink_args=None
                  ):
         super().__init__()
         self._mesh = mesh
@@ -511,7 +527,7 @@ class UlyssesAttnMode(BaseTorchFunctionMode):
         self._attention_type = attention_type
         self._method = method
         self._threshold_attn_args = threshold_attn_args
-
+        self._sink_args = sink_args
     def __torch_function__(self, func, types, args=(), kwargs=None):
         kwargs = {} if kwargs is None else kwargs
 
@@ -542,6 +558,7 @@ class UlyssesAttnMode(BaseTorchFunctionMode):
             attention_type=self._attention_type,
             method=self._method,
             threshold_attn_args=self._threshold_attn_args,
+            sink_args=self._sink_args
         )
 
     @classmethod

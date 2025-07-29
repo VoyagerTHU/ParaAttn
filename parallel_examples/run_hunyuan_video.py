@@ -76,7 +76,7 @@ if num_frames == 129:
 else:
     one_time_ref = False
 
-attention_type = 'repeat_interpolation'
+attention_type = 'interpolation'
 method = 'thres'
 
 sample_mse_max_row = 64
@@ -86,8 +86,8 @@ wide_width = 2
 threshold = 0.5
 prompt_name = '_'.join(lis[0].split(' ')[0:3])
 
-alpha = 0.95
-beta = 0.90
+alpha = 1.00
+beta = 0.95
 xpos = 0.95
 xpos_xi = xpos**(1/16000)
 sigmoid_a = 1.0
@@ -181,7 +181,7 @@ output = pipe(
     height=544,
     width=960,
     num_frames=num_frames,
-    num_inference_steps=30,
+    num_inference_steps=50,
     output_type="pil" if dist.get_rank() == 0 else "pt",
     generator = torch.Generator(device="cuda").manual_seed(42),
 ).frames[0]

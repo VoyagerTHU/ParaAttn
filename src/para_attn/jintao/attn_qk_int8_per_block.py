@@ -20,6 +20,8 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len, current_flag,
                     alpha_xpos_xi: tl.constexpr = 0.9999967941742395,
                     beta_xpos_xi: tl.constexpr = 0.9999860536252945,
                     text_false_length: tl.constexpr = 247,
+                    sink_width: tl.constexpr = 4,
+                    window_width: tl.constexpr = 16,
                     ):
     DEFAULT=0
     XPOS=1
@@ -30,7 +32,8 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len, current_flag,
     TEMPORAL=6
     REPEAT=7
     REPEAT_INTERPOLATION=8
-    
+    SINK=9
+
     LOG2_XPOS = tl.log2(tl.full((), xpos_xi, dtype=tl.float32))
     lo, hi = 0, kv_len
     for start_n in range(lo, hi, BLOCK_N):
@@ -149,7 +152,49 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len, current_flag,
             
             qk = tl.where(bad & mask3, -1e4, qk)
         
-        
+        if current_flag == SINK:
+            dist    = tl.abs(m - n).to(tl.float32)             # |m-n|
+            # xpos_pow = tl.math.exp2(dist * LOG2_XPOS)   
+            mask_in_sink = (n < 2040 * sink_width)
+            mask_in_window = dist < 2040 * window_width / 2
+            skip_processing = mask_in_sink | mask_in_window
+
+            # 计算所有需要的值（即使某些情况下不会使用）
+            STEP = tl.constexpr(544 * 960 // 16 // 16)  # 2040
+            dist_i = tl.abs(m - n).to(tl.int32)
+            bad = ((dist_i >= 46 * STEP) & (dist_i <= 54 * STEP)) | \
+                ((dist_i >= 96 * STEP) & (dist_i <= 104 * STEP))
+            
+            # 使用预计算的常数
+            alpha_log = tl.log2(tl.full((), alpha_xpos_xi, dtype=tl.float32))
+            beta_log = tl.log2(tl.full((), beta_xpos_xi, dtype=tl.float32))
+            
+            # 计算帧内位置
+            frame_tokens_scalar = tl.full((), frame_tokens, dtype=tl.float32)
+            n_pos_within_frame = n % frame_tokens_scalar
+            half_frame = frame_tokens_scalar / 2
+            
+            # 使用tl.where避免分支divergence
+            mask = n_pos_within_frame < half_frame
+            factor1 = 1 - n_pos_within_frame / half_frame
+            factor2 = (n_pos_within_frame - half_frame) / half_frame
+            interp_factor = tl.where(mask, factor1, factor2)
+            
+            # 计算距离和幂次
+            dist_new = tl.where(m > n, m - n - 2040 * window_width / 2, n - m - 2040 * window_width / 2).to(tl.float32)
+            # dist_new = tl.abs(m - n).to(tl.float32)
+
+            alpha_xpos_pow = tl.math.exp2(dist_new * alpha_log)
+            beta_xpos_pow = tl.math.exp2(dist_new * beta_log)
+            
+            # 插值计算
+            xpos_pow = interp_factor * alpha_xpos_pow + (1 - interp_factor) * beta_xpos_pow
+            qk_processed = tl.where(mask3, qk*xpos_pow, qk)
+            qk_processed = tl.where(bad & mask3, 0, qk_processed)
+            
+            # 使用tl.where选择最终结果：如果在sink或window内，保持原qk，否则使用处理后的qk
+            qk = tl.where(skip_processing, qk, qk_processed)
+
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
         qk = qk - m_ij[:, None]
         p = tl.math.exp2(qk)
@@ -187,7 +232,10 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out,
               sigmoid_a: tl.constexpr = 1.0, 
               alpha_xpos_xi: tl.constexpr = 0.9999967941742395, 
               beta_xpos_xi: tl.constexpr = 0.9999860536252945,
-              text_false_length: tl.constexpr = 247,):
+              text_false_length: tl.constexpr = 247,
+              sink_width: tl.constexpr = 4,
+              window_width: tl.constexpr = 16,
+              ):
     start_m = tl.program_id(0)
 
     off_z = tl.program_id(2).to(tl.int64)
@@ -225,7 +273,9 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out,
                                     sigmoid_a=sigmoid_a,
                                     alpha_xpos_xi=alpha_xpos_xi,
                                     beta_xpos_xi=beta_xpos_xi,
-                                    text_false_length=text_false_length
+                                    text_false_length=text_false_length,
+                                    sink_width=sink_width,
+                                    window_width=window_width,
                                     )
     acc = acc / l_i[:, None]
     tl.store(O_block_ptr, acc.to(Out.type.element_ty), mask = (offs_m[:, None] < qo_len))
@@ -236,7 +286,10 @@ def forward(q, k, v, flags, q_scale, k_scale, tensor_layout="HND", output_dtype=
               sigmoid_a: tl.constexpr = 1.0, 
               alpha_xpos_xi: tl.constexpr = 0.9999967941742395, 
               beta_xpos_xi: tl.constexpr = 0.9999860536252945,
-              text_false_length: tl.constexpr = 247):
+              text_false_length: tl.constexpr = 247,
+              sink_width: tl.constexpr = 4,
+              window_width: tl.constexpr = 16,
+              ):
     BLOCK_M = 128
     BLOCK_N = 64
     stage = 1
@@ -288,5 +341,7 @@ def forward(q, k, v, flags, q_scale, k_scale, tensor_layout="HND", output_dtype=
         alpha_xpos_xi=alpha_xpos_xi, 
         beta_xpos_xi=beta_xpos_xi,
         text_false_length=text_false_length,
+        sink_width=sink_width,
+        window_width=window_width,
         )
     return o

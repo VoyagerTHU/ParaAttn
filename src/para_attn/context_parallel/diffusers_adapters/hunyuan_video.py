@@ -29,6 +29,7 @@ def parallelize_transformer(
         attention_type='original',
         method="thres",
         threshold_attn_args=None,
+        sink_args=None,
     ):
     if getattr(transformer, "_is_parallelized", False):
         return transformer
@@ -141,6 +142,7 @@ def parallelize_transformer(
                 attention_type=attention_type,
                 method=method,
                 threshold_attn_args=threshold_attn_args,
+                sink_args=sink_args,
             ):
             # 4. Transformer blocks
             hidden_states, encoder_hidden_states = self.call_transformer_blocks(
