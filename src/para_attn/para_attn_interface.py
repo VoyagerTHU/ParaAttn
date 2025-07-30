@@ -240,6 +240,37 @@ def ulysses_attn_func(
                                 xpos_xi=threshold_attn_args['xi_for_XPOS'])
         elif attention_type == 'sink':
             flags = (torch.ones((b, n), dtype=torch.long) * SINK).to(key.device)
+            # flags = get_spatial_temporal_flag(query, key, value, 
+            #         attention_masks_narrow=threshold_attn_args['attention_masks_narrow'], 
+            #         attention_masks_wide=threshold_attn_args['attention_masks_wide'], 
+            #         mask_selected_indices=threshold_attn_args['mask_selected_indices'],
+            #         method="proportional", 
+            #         num_sampled_rows=threshold_attn_args['num_sampled_rows'], 
+            #         threshold=threshold_attn_args['threshold'])
+            # flags = flags * SINK
+            if sink_args['sink_width'] is None:
+                raise ValueError("sink_width is not provided")
+            if sink_args['window_width'] is None:
+                raise ValueError("window_width is not provided")
+            out = attn_func(query, key, value, flags=flags, 
+                            is_causal=is_causal, sm_scale=scale, 
+                            text_false_length=text_false_length,
+                            alpha_xpos_xi=sink_args['alpha_xpos_xi'],
+                            beta_xpos_xi=sink_args['beta_xpos_xi'],
+                            sink_width=sink_args['sink_width'],
+                            window_width=sink_args['window_width'],
+                            frame_tokens=attention_args['frame_tokens']
+                            )
+        elif attention_type == 'sink_pattern':
+            # flags = (torch.ones((b, n), dtype=torch.long) * SINK).to(key.device)
+            flags = get_spatial_temporal_flag(query, key, value, 
+                    attention_masks_narrow=threshold_attn_args['attention_masks_narrow'], 
+                    attention_masks_wide=threshold_attn_args['attention_masks_wide'], 
+                    mask_selected_indices=threshold_attn_args['mask_selected_indices'],
+                    method="proportional", 
+                    num_sampled_rows=threshold_attn_args['num_sampled_rows'], 
+                    threshold=threshold_attn_args['threshold'])
+            flags = flags * SINK
             if sink_args['sink_width'] is None:
                 raise ValueError("sink_width is not provided")
             if sink_args['window_width'] is None:

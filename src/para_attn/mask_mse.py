@@ -338,6 +338,45 @@ def direct_threshold(query, key, value, attention_masks_narrow, attention_masks_
     # 其余情况保持为2
     return flags
 
+
+def direct_threshold_proportional(query, key, attention_masks_narrow, num_sampled_rows, mask_selected_indices=None, threshold=0.5):
+    cfg, num_heads, seq_len, dim = query.size()
+    num_sampled_rows = min(num_sampled_rows, seq_len)
+
+    # Get the number of rows available in the attention masks
+    sample_mse_max_row = attention_masks_narrow[0].shape[0]
+    
+    # If mask_selected_indices is provided, it means we're using the new get_attention_mask
+    # and need to sample from the pre-selected rows
+    if mask_selected_indices is not None:
+        if num_sampled_rows <= len(mask_selected_indices):
+            sampled_indices_in_mask = torch.linspace(0, sample_mse_max_row - 1, num_sampled_rows).long()
+            sampled_rows = mask_selected_indices[sampled_indices_in_mask]
+        else:
+            sampled_rows = mask_selected_indices
+            sampled_indices_in_mask = torch.arange(sample_mse_max_row)
+    else:
+        sampled_rows = torch.linspace(0, sample_mse_max_row - 1, num_sampled_rows).long()
+        sampled_indices_in_mask = sampled_rows
+    
+    sampled_q = query[:, :, sampled_rows, :]
+    sampled_qk_scores = torch.matmul(sampled_q, key.transpose(-2, -1)) / (dim**0.5)
+    
+    sampled_attn_weights = F.softmax(sampled_qk_scores, dim=-1)
+
+    flags = torch.zeros((cfg, num_heads), dtype=torch.long, device=query.device)
+    
+    # 检查narrow mask - use the indices within the mask
+
+    sampled_attention_mask_narrow = attention_masks_narrow[0]
+    masked_qk_weights_narrow = sampled_attn_weights.masked_fill(sampled_attention_mask_narrow == 0, 0)
+    masked_qk_weights_sum_narrow = torch.sum(masked_qk_weights_narrow, dim=-1).mean(dim=-1)  # (cfg, num_heads)
+
+    narrow_condition = masked_qk_weights_sum_narrow > threshold
+    flags[narrow_condition] = 1
+
+    return flags
+    
 def get_spatial_temporal_flag(q, k, v, attention_masks_narrow, attention_masks_wide, num_sampled_rows, method="thres", mask_selected_indices=None, threshold=0.6):
     # sampled_mses = sample_mse(q, k, v, attention_masks, num_sampled_rows)
     # best_mask_idx = torch.argmin(sampled_mses, dim=0)
@@ -350,5 +389,7 @@ def get_spatial_temporal_flag(q, k, v, attention_masks_narrow, attention_masks_w
     elif method == "simple":
         cfg, num_heads, seq_len, dim = q.size()
         flags = torch.zeros((cfg, num_heads), dtype=torch.long, device=q.device)
+    elif method == "proportional":
+        flags = direct_threshold_proportional(q, k, attention_masks_narrow, num_sampled_rows, mask_selected_indices, threshold=threshold)
     return flags
 
