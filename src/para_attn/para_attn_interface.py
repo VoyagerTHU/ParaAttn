@@ -37,6 +37,9 @@ try:
 except ImportError:
     torch_ring_attention = None
 
+from .methods import pad_qkv, get_block_bias, get_decay_mask
+from .jintao import search_kernel
+
 # from sageattention import sageattn
 
 __all__ = [
@@ -110,9 +113,9 @@ def ulysses_attn_func(
     block_id=0,
     timestep=0,
     attention_type='original',
-    method="thres",
     threshold_attn_args=None,
-    sink_args=None
+    sink_args=None,
+    block_avg_args=None
 ):
     assert query.ndim == 4, "query must have 4 dimensions, got {}".format(query.ndim)
     assert key.ndim == 4, "key must have 4 dimensions, got {}".format(key.ndim)
@@ -205,7 +208,7 @@ def ulysses_attn_func(
                     attention_masks_narrow=threshold_attn_args['attention_masks_narrow'], 
                     attention_masks_wide=threshold_attn_args['attention_masks_wide'], 
                     mask_selected_indices=threshold_attn_args['mask_selected_indices'],
-                    method=method, 
+                    method=threshold_attn_args['method'], 
                     num_sampled_rows=threshold_attn_args['num_sampled_rows'], 
                     threshold=threshold_attn_args['threshold'])
             
@@ -215,9 +218,7 @@ def ulysses_attn_func(
             if threshold_attn_args['one_time_ref'] == True:
                 # 获得当前在world中是第几个机器
                 rank = dist.get_rank()
-                savepath = f'{output_dir}/{sub_dir}/attention_patterns_{threshold_attn_args["threshold"]}/world_size_{world_size}/head_type_{block_id}_headbatch_{rank}_in_{world_size}_{timestep.item()}'
-                if threshold_attn_args['cfg'] == True:
-                    savepath = f'{output_dir}/{sub_dir}/attention_patterns_{threshold_attn_args["threshold"]}/world_size_{world_size}/head_type_cfg_{block_id}_headbatch_{rank}_in_{world_size}_{timestep.item()}'
+                savepath = f'{output_dir}/{sub_dir}/attention_patterns_{threshold_attn_args["pattern_threshold"]}_method_{threshold_attn_args["method"]}/world_size_{world_size}/head_type_{block_id}_headbatch_{rank}_in_{world_size}_{timestep.item()}'
                 savepath = Path(savepath).with_suffix('.pt')
                 savepath.parent.mkdir(parents=True, exist_ok=True)
                 torch.save(flags, savepath)
@@ -225,29 +226,65 @@ def ulysses_attn_func(
                 out = attn_func(query, key, value, flags=flags, 
                                 is_causal=is_causal, sm_scale=scale, 
                                 text_false_length=text_false_length,
-                                xpos_xi=threshold_attn_args['xi_for_XPOS'])
+                                )
             else:
-                load_path = f'{output_dir}/{sub_dir}/attention_patterns_{threshold_attn_args["threshold"]}/world_size_{world_size}/head_type_{block_id}_headbatch_{rank}_in_{world_size}_{timestep.item()}'
-                if threshold_attn_args['cfg'] == True:
-                    load_path = f'{output_dir}/{sub_dir}/attention_patterns_{threshold_attn_args["threshold"]}/world_size_{world_size}/head_type_cfg_{block_id}_headbatch_{rank}_in_{world_size}_{timestep.item()}'
-                load_path = Path(load_path).with_suffix('.pt')
-                flags = torch.load(load_path, map_location='cpu')
-                flags = flags.to(query.device)
-            
-                out = attn_func(query, key, value, flags=flags, 
-                                is_causal=is_causal, sm_scale=scale, 
-                                text_false_length=text_false_length,
-                                xpos_xi=threshold_attn_args['xi_for_XPOS'])
+                raise ValueError("get pattern should be run in num_frames=129")
         elif attention_type == 'sink':
-            flags = (torch.ones((b, n), dtype=torch.long) * SINK).to(key.device)
-            # flags = get_spatial_temporal_flag(query, key, value, 
-            #         attention_masks_narrow=threshold_attn_args['attention_masks_narrow'], 
-            #         attention_masks_wide=threshold_attn_args['attention_masks_wide'], 
-            #         mask_selected_indices=threshold_attn_args['mask_selected_indices'],
-            #         method="proportional", 
-            #         num_sampled_rows=threshold_attn_args['num_sampled_rows'], 
-            #         threshold=threshold_attn_args['threshold'])
-            # flags = flags * SINK
+            if not attention_args['use_pattern_flags']:
+                flags = (torch.ones((b, n), dtype=torch.long)).to(key.device)
+            else:
+                # ========= get flags begin =========
+                if not attention_args['use_one_time_flags']:
+                    flags = get_spatial_temporal_flag(query, key, value, 
+                            attention_masks_narrow=threshold_attn_args['attention_masks_narrow'], 
+                            attention_masks_wide=threshold_attn_args['attention_masks_wide'], 
+                            mask_selected_indices=threshold_attn_args['mask_selected_indices'],
+                            method=threshold_attn_args['method'], 
+                            num_sampled_rows=threshold_attn_args['num_sampled_rows'], 
+                            threshold=threshold_attn_args['threshold'])
+                else:
+                    output_dir = "Attention_patterns"
+                    sub_dir = threshold_attn_args.get('sub_dir', 'default')
+                    rank = dist.get_rank()
+                    load_path = f'{output_dir}/{sub_dir}/attention_patterns_{threshold_attn_args["pattern_threshold"]}_method_{threshold_attn_args["method"]}/world_size_{world_size}/head_type_{block_id}_headbatch_{rank}_in_{world_size}_{timestep.item()}'
+                    load_path = Path(load_path).with_suffix('.pt')
+                    flags = torch.load(load_path, map_location='cpu')
+                    flags = flags.to(query.device)
+                # ========= get flags end =========
+
+            # 在flags是0的地方变成REPEAT_MASK
+            if sink_args['repeat_mask_in_sink']:
+                flags = torch.where(flags == 0, torch.full_like(flags, REPEAT), flags)
+            flags = torch.where(flags == 1, torch.full_like(flags, SINK), flags)
+
+            decay_mask = None
+            if not attention_args['use_decay_mask']:
+                decay_mask = None
+            else:
+                rank = dist.get_rank()
+                if not attention_args['use_one_timestep_block_avg']:
+                    block_avg = torch.load(f"block_avg/{attention_args['prompt_name']}/num_frames{attention_args['num_frames']}/world_size_{world_size}/block_{block_id}_rank_{rank}_timestep_{int(timestep.item())}_block_avg.pt")
+                    block_avg = block_avg.to(query.device)
+                    decay_mask = get_decay_mask(block_avg, attention_args['decay_mask_threshold'])
+                else:
+                    block_avg = torch.load(f"block_avg_one_timestep/{attention_args['prompt_name']}/num_frames{attention_args['num_frames']}/world_size_{world_size}/block_{block_id}_rank_{rank}_block_avg.pt")
+                    block_avg = block_avg.to(query.device)
+                    decay_mask = get_decay_mask(block_avg, attention_args['decay_mask_threshold'])
+
+            block_bias = None
+            if attention_args['use_block_bias']:
+                rank = dist.get_rank()
+                if not attention_args['use_one_timestep_block_avg']:
+                    block_avg = torch.load(f"block_avg/{attention_args['prompt_name']}/num_frames{attention_args['num_frames']}/world_size_{world_size}/block_{block_id}_rank_{rank}_timestep_{int(timestep.item())}_block_avg.pt")
+                    block_avg = block_avg.to(query.device)
+                    block_bias = get_block_bias(block_avg, block_avg_args)
+                    block_bias = block_bias.to(query.device)
+                else:
+                    block_avg = torch.load(f"block_avg_one_timestep/{attention_args['prompt_name']}/num_frames{attention_args['num_frames']}/world_size_{world_size}/block_{block_id}_rank_{rank}_block_avg.pt")
+                    block_avg = block_avg.to(query.device)
+                    block_bias = get_block_bias(block_avg, block_avg_args)
+                    block_bias = block_bias.to(query.device)
+
             if sink_args['sink_width'] is None:
                 raise ValueError("sink_width is not provided")
             if sink_args['window_width'] is None:
@@ -259,31 +296,34 @@ def ulysses_attn_func(
                             beta_xpos_xi=sink_args['beta_xpos_xi'],
                             sink_width=sink_args['sink_width'],
                             window_width=sink_args['window_width'],
-                            frame_tokens=attention_args['frame_tokens']
+                            frame_tokens=attention_args['frame_tokens'],
+                            decay_mask=decay_mask,
+                            block_bias=block_bias,
+                            repeat_mask_in_sink=sink_args['repeat_mask_in_sink']
                             )
-        elif attention_type == 'sink_pattern':
-            # flags = (torch.ones((b, n), dtype=torch.long) * SINK).to(key.device)
-            flags = get_spatial_temporal_flag(query, key, value, 
-                    attention_masks_narrow=threshold_attn_args['attention_masks_narrow'], 
-                    attention_masks_wide=threshold_attn_args['attention_masks_wide'], 
-                    mask_selected_indices=threshold_attn_args['mask_selected_indices'],
-                    method="proportional", 
-                    num_sampled_rows=threshold_attn_args['num_sampled_rows'], 
-                    threshold=threshold_attn_args['threshold'])
-            flags = flags * SINK
-            if sink_args['sink_width'] is None:
-                raise ValueError("sink_width is not provided")
-            if sink_args['window_width'] is None:
-                raise ValueError("window_width is not provided")
-            out = attn_func(query, key, value, flags=flags, 
-                            is_causal=is_causal, sm_scale=scale, 
-                            text_false_length=text_false_length,
-                            alpha_xpos_xi=sink_args['alpha_xpos_xi'],
-                            beta_xpos_xi=sink_args['beta_xpos_xi'],
-                            sink_width=sink_args['sink_width'],
-                            window_width=sink_args['window_width'],
-                            frame_tokens=attention_args['frame_tokens']
-                            )
+        elif attention_type=="get_block_avg":
+            out = attn_func(query, key, value, 
+                                is_causal=False, sm_scale=None, 
+                                text_false_length=0)
+            bsz,num_heads,seq_len,head_dim = query.shape
+            padding_length = (attention_args['block_size'] - (seq_len % attention_args['block_size'])) % attention_args['block_size']
+            pad_len = seq_len + padding_length
+            q_pad,k_pad,v_pad= pad_qkv(query, attention_args['block_size']),pad_qkv(key,attention_args['block_size']),pad_qkv(value,attention_args['block_size'])
+            _,m,block_avg= search_kernel._flash_attn_triton_search(q_pad,k_pad,v_pad)
+
+            save_one_timestep = attention_args['save_one_timestep']
+            if not save_one_timestep:
+                # save block_avg
+                rank = dist.get_rank()
+                os.makedirs(f"block_avg/{attention_args['prompt_name']}/num_frames{attention_args['num_frames']}/world_size_{world_size}", exist_ok=True)
+                torch.save(block_avg.detach().cpu(),f"block_avg/{attention_args['prompt_name']}/num_frames{attention_args['num_frames']}/world_size_{world_size}/block_{block_id}_rank_{rank}_timestep_{int(timestep.item())}_block_avg.pt")
+            else:
+                rank = dist.get_rank()
+                os.makedirs(f"block_avg_one_timestep/{attention_args['prompt_name']}/num_frames{attention_args['num_frames']}/world_size_{world_size}", exist_ok=True)
+                save_path = f"block_avg_one_timestep/{attention_args['prompt_name']}/num_frames{attention_args['num_frames']}/world_size_{world_size}/block_{block_id}_rank_{rank}_block_avg.pt"
+                if os.path.exists(save_path):
+                    raise ValueError("already saved the last timestep, quitting...")
+                torch.save(block_avg.detach().cpu(),save_path)
         else:
             raise ValueError(f"Unknown attention type: {attention_type}")
     out = _sdpa_output_all_to_all(out, mesh)
@@ -544,9 +584,9 @@ class UlyssesAttnMode(BaseTorchFunctionMode):
                  attention_args=None,
                  timestep=0,
                  attention_type='original',
-                 method="thres",
                  threshold_attn_args=None,
-                 sink_args=None
+                 sink_args=None,
+                 block_avg_args=None
                  ):
         super().__init__()
         self._mesh = mesh
@@ -556,9 +596,9 @@ class UlyssesAttnMode(BaseTorchFunctionMode):
         self._block_id = 0
         self._timestep = timestep
         self._attention_type = attention_type
-        self._method = method
         self._threshold_attn_args = threshold_attn_args
         self._sink_args = sink_args
+        self._block_avg_args = block_avg_args
     def __torch_function__(self, func, types, args=(), kwargs=None):
         kwargs = {} if kwargs is None else kwargs
 
@@ -587,9 +627,9 @@ class UlyssesAttnMode(BaseTorchFunctionMode):
             block_id=self._block_id - 1,
             timestep=self._timestep,
             attention_type=self._attention_type,
-            method=self._method,
             threshold_attn_args=self._threshold_attn_args,
-            sink_args=self._sink_args
+            sink_args=self._sink_args,
+            block_avg_args=self._block_avg_args
         )
 
     @classmethod

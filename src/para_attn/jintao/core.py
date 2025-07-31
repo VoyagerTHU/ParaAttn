@@ -34,6 +34,9 @@ def jintao_sage(
     text_false_length: tl.constexpr = 247,
     sink_width: tl.constexpr = 4,
     window_width: tl.constexpr = 16,
+    block_bias: Optional[torch.Tensor] = None,
+    decay_mask: Optional[torch.Tensor] = None,
+    repeat_mask_in_sink: bool = False,
 ) -> torch.Tensor:
     """
 
@@ -122,11 +125,11 @@ def jintao_sage(
     if is_causal:
         raise NotImplementedError
     else:
-        o = attn_false(q_int8, k_int8, v, flags, 
+        o = attn_false(q_int8, k_int8, v, flags, block_bias, decay_mask, 
                        q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=dtype, 
                        xpos_xi=xpos_xi, sigmoid_a=sigmoid_a, 
                        alpha_xpos_xi=alpha_xpos_xi, beta_xpos_xi=beta_xpos_xi, 
                        text_false_length=text_false_length, frame_tokens=frame_tokens,
-                       sink_width=sink_width, window_width=window_width)
+                       sink_width=sink_width, window_width=window_width,repeat_mask_in_sink=repeat_mask_in_sink)
 
     return o

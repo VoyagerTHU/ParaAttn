@@ -7,6 +7,7 @@ import os
 import itertools
 import json
 from datetime import datetime
+import torch.nn.functional as F
 
 # 添加项目根目录到Python路径
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -73,7 +74,65 @@ def get_attention_masks(attention_type, sample_mse_max_row, context_length, num_
     
     return attention_masks_narrow, attention_masks_wide, mask_selected_indices
 
-def parallelize_model(pipe, mesh, attention_type, attention_args, threshold_attn_args, sink_args):
+
+def get_ref_function(
+    blocks_num: int,
+    ref_name: str,
+    k=0.0025,
+    a=0.7,
+    b=0.1,
+    c=0.0001,
+    r=10,
+    window_size: int = 128
+):
+    if ref_name == 'uniform':
+        ref_function = torch.ones(blocks_num, blocks_num) / blocks_num
+
+    elif ref_name == 'linear':
+        ref_function = torch.linspace(0, 1, blocks_num)
+
+    elif ref_name == 'swa':
+        ref_function = torch.zeros((blocks_num, blocks_num))
+        row = torch.arange(blocks_num).unsqueeze(1)
+        col = torch.arange(blocks_num).unsqueeze(0)
+        mask = (row - col).abs() < window_size
+        ref_function[mask] = float('inf')
+
+    elif ref_name == 'clean':
+        ref_function = torch.full((blocks_num, blocks_num), float('inf'))
+
+    elif ref_name == 'interpolation':
+        ref_function = torch.ones(blocks_num, blocks_num)
+        idx = torch.arange(blocks_num)
+        s = (idx.view(-1, 1) - idx.view(1, -1)).abs().float()
+
+        # z 计算
+        frac = torch.remainder(128.0 * s / 1560.0, 1.0)          # ∈ [0,1)
+        z = (2.0 * (frac - 0.5).abs()) ** r                      # ∈ [0,1]
+
+        # 衰减
+        exp_a = torch.pow(a, 128.0 * s / 16380.0)
+        exp_b = torch.pow(b, 128.0 * s / 16380.0)
+        decay = k * (z * exp_a + (1.0 - z) * exp_b) + c
+
+        mask_far = s > window_size
+        ref_function[mask_far] *= decay[mask_far]                    # >128 ⇒ 衰减
+
+
+    else:
+        return  torch.ones(blocks_num, blocks_num) / blocks_num
+        # raise ValueError(f"Invalid ref name: {ref_name}")
+
+    return pad_ref_function(ref_function)
+
+def pad_ref_function(ref_function):
+    """pad trivial text part"""
+    # from 1,1,1578,1578 to 1,1,1580,1580
+    ref_function = ref_function.unsqueeze(0).unsqueeze(0)
+    ref_function = F.pad(ref_function, (0, 2, 0, 2), mode='constant', value=float('inf'))
+    return ref_function.squeeze(0).squeeze(0)
+
+def parallelize_model(pipe, mesh, attention_type, attention_args, threshold_attn_args, sink_args, block_avg_args):
     """并行化模型"""
     parallelize_pipe(
         pipe,
@@ -81,9 +140,9 @@ def parallelize_model(pipe, mesh, attention_type, attention_args, threshold_attn
         new_attention=jintao_sage,
         attention_args=attention_args,
         attention_type=attention_type,
-        method='thres',
         threshold_attn_args=threshold_attn_args,
         sink_args=sink_args,
+        block_avg_args=block_avg_args,
     )
     parallelize_vae(pipe.vae, mesh=mesh._flatten())
 
@@ -136,132 +195,165 @@ def get_filename(attention_type, params, num_frames):
         beta = params.get('beta', 0.95)
         sink_width = params.get('sink_width', 4)
         window_width = params.get('window_width', 16)
-        return f"hunyuan_video_sink_alpha_{alpha}_beta_{beta}_sinkwidth_{sink_width}_windowwidth_{window_width}_{num_frames}.mp4"
-    elif attention_type == 'sink_pattern':
-        alpha = params.get('alpha', 1.00)
-        beta = params.get('beta', 0.95)
-        sink_width = params.get('sink_width', 4)
-        window_width = params.get('window_width', 16)
-        return f"hunyuan_video_sink_pattern_alpha_{alpha}_beta_{beta}_sinkwidth_{sink_width}_windowwidth_{window_width}_{num_frames}.mp4"
+        use_pattern_flags = params.get('use_pattern_flags', True)
+        use_one_time_flags = params.get('use_one_time_flags', True)
+        use_decay_mask = params.get('use_decay_mask', True)
+        return f"hunyuan_video_sink_alpha_{alpha}_beta_{beta}_sinkwidth_{sink_width}_windowwidth_{window_width}_use_pattern_flags_{use_pattern_flags}_use_one_time_flags_{use_one_time_flags}_use_decay_mask_{use_decay_mask}_{num_frames}.mp4"
+    elif attention_type == 'get_block_avg':
+        return f"hunyuan_video_get_block_avg_{num_frames}.mp4"
     else:
         raise ValueError(f"Invalid attention type: {attention_type}")
 
 def run_experiment(config, pipe):
     """运行单个实验"""
-    try:
-    # init_distributed()
-        prompt_name = '_'.join(config['prompt'].split(' ')[0:10])
-        filename = get_filename(config['attention_type'], config, config['num_frames'])
-        if os.path.exists(f"output_videos_new/{prompt_name}/{config['attention_type']}/{filename}"):
-            print(f"Video already exists: {filename}, skipping")
-            return True
-        
-        # 设置参数
-        attention_type = config['attention_type']
-        num_frames = config['num_frames']
-        height = config['height']
-        width = config['width']
-        prompt = config['prompt']
-        num_inference_steps = config['num_inference_steps']
-        generator_seed = config['generator_seed']
-        
-        # 计算frame_size
-        frame_size = (height // 16) * (width // 16)
-        
-        # 获取attention masks
-        attention_masks_narrow = None
-        attention_masks_wide = None
-        mask_selected_indices = None
-        threshold_attn_args = None
-        if attention_type in ['pattern', 'sink', 'sink_pattern']:
-            attention_masks_narrow, attention_masks_wide, mask_selected_indices = get_attention_masks(
-                attention_type, 
-                config['sample_mse_max_row'], 
-                config['context_length'], 
-                num_frames, 
-                frame_size, 
-                config['narrow_width'], 
-                config['wide_width']
-            )
-            # print(f"attention_masks_narrow: {attention_masks_narrow.shape}")
-            # print(f"attention_masks_wide: {attention_masks_wide.shape}")
-            # 设置threshold参数
-            threshold_attn_args = {
-                'threshold': config['threshold'] if attention_type == 'pattern' else config['narrow_width'] * 2 / ((num_frames - 1) // 4 + 1),
-                'one_time_ref': num_frames == 129,
-                'mask_selected_indices': mask_selected_indices,
-                'attention_masks_narrow': attention_masks_narrow,
-                'attention_masks_wide': attention_masks_wide,
-                'num_sampled_rows': config['sample_mse_max_row'],
-                'sub_dir': '_'.join(prompt.split(' ')[0:10]),
-                'cfg': True,
-                'xi_for_XPOS': 0.9999934149894527,
-            }
-        
-        # 设置attention参数
-        attention_args = {
-            'frame_tokens': 2040,
+    # try:
+    prompt_name = '_'.join(config['prompt'].split(' ')[0:10])
+    filename = get_filename(config['attention_type'], config, config['num_frames'])
+    if os.path.exists(f"output_videos_new/{prompt_name}/{config['attention_type']}/{filename}"):
+        print(f"Video already exists: {filename}, skipping")
+        return True
+    
+    # 设置参数
+    attention_type = config['attention_type']
+    num_frames = config['num_frames']
+    height = config['height']
+    width = config['width']
+    prompt = config['prompt']
+    num_inference_steps = config['num_inference_steps']
+    generator_seed = config['generator_seed']
+    
+    # 计算frame_size
+    frame_size = (height // 16) * (width // 16)
+    
+    # 获取attention masks
+    attention_masks_narrow = None
+    attention_masks_wide = None
+    mask_selected_indices = None
+    threshold_attn_args = None
+
+    latents = (num_frames - 1) // 4 + 1
+
+    if attention_type == 'pattern' or (attention_type == 'sink' and config['use_pattern_flags']):
+        attention_masks_narrow, attention_masks_wide, mask_selected_indices = get_attention_masks(
+            attention_type, 
+            config['sample_mse_max_row'], 
+            config['context_length'], 
+            num_frames, 
+            frame_size, 
+            config['narrow_width'], 
+            config['wide_width']
+        )
+        # print(f"attention_masks_narrow: {attention_masks_narrow.shape}")
+        # print(f"attention_masks_wide: {attention_masks_wide.shape}")
+        # 设置threshold参数
+        threshold_attn_args = {
+            'threshold': (config['narrow_width'] * 2 * config['pattern_threshold'] / ((num_frames - 1) // 4 + 1)),
+            'pattern_threshold': config['pattern_threshold'],
+            'one_time_ref': num_frames == 129,
+            'mask_selected_indices': mask_selected_indices,
+            'attention_masks_narrow': attention_masks_narrow,
+            'attention_masks_wide': attention_masks_wide,
+            'num_sampled_rows': config['sample_mse_max_row'],
+            'sub_dir': prompt_name,
+            'method': config['method'],
         }
-        
-        # 根据attention_type添加特定参数
-        if attention_type in ['XPOS', 'pattern']:
-            xpos = config['xpos']
-            attention_args.update({
-                'xpos_xi': xpos**(1/16000),
-                'sigmoid_a': config['sigmoid_a'],
-            })
-        
-        if attention_type in ['interpolation', 'repeat_interpolation']:
-            alpha = config['alpha']
-            beta = config['beta']
-            attention_args.update({
-                'alpha_xpos_xi': float(alpha)**(1/16000),
-                'beta_xpos_xi': float(beta)**(1/16000),
+    
+    # 设置attention参数
+    attention_args = {
+        'frame_tokens': 2040,
+        'prompt_name': prompt_name,
+        'num_frames': num_frames,
+        'use_pattern_flags': config['use_pattern_flags'] if attention_type not in ['get_block_avg', 'pattern'] else False,
+        'use_one_time_flags': config['use_one_time_flags'] if attention_type not in ['get_block_avg', 'pattern'] else False,
+        'use_decay_mask': config['use_decay_mask'] if attention_type not in ['get_block_avg', 'pattern'] else False,
+        'use_one_timestep_block_avg': config['use_one_timestep_block_avg'] if attention_type not in ['get_block_avg', 'pattern'] else False,
+        'use_block_bias': config['use_block_bias'] if attention_type not in ['get_block_avg', 'pattern'] else False,
+    }
+
+    if attention_args['use_decay_mask']:
+        attention_args['decay_mask_threshold'] = config['decay_mask_threshold'] if attention_type not in ['get_block_avg', 'pattern'] else 0.0000
+    
+    # 根据attention_type添加特定参数
+    if attention_type in ['XPOS']:
+        xpos = config['xpos']
+        attention_args.update({
+            'xpos_xi': xpos**(1/16000),
+        })
+    
+    if attention_type in ['interpolation', 'repeat_interpolation']:
+        alpha = config['alpha']
+        beta = config['beta']
+        attention_args.update({
+            'alpha_xpos_xi': float(alpha)**(1/16000),
+            'beta_xpos_xi': float(beta)**(1/16000),
+        })
+
+    sink_args = None
+    block_avg_args = {}
+    if attention_type in ['sink']:
+        sink_args = {
+            'sink_width': config['sink_width'],
+            'window_width': config['window_width'],
+            'alpha_xpos_xi': float(config['alpha'])**(1/16000),
+            'beta_xpos_xi': float(config['beta'])**(1/16000),
+            'repeat_mask_in_sink': config['repeat_mask_in_sink'],
+        }
+        block_num = (latents * 2040 + 127) // 128
+        if config['use_decay_mask']:
+            block_avg_args.update({
+                'threshold': config['decay_mask_threshold'],
             })
 
-        if attention_type in ['sink', 'sink_pattern']:
-            sink_args = {
-                'sink_width': config['sink_width'],
-                'window_width': config['window_width'],
-                'alpha_xpos_xi': float(config['alpha'])**(1/16000),
-                'beta_xpos_xi': float(config['beta'])**(1/16000),
-            }
+        if config['use_block_bias']:
+            block_avg_args.update({
+                'ref_function': get_ref_function(block_num, config['ref_function_name']),
+            })
+
+
+    if attention_type in ['get_block_avg']:
+        attention_args.update({
+            'block_size': 128,
+            'prompt_name': prompt_name,
+            'num_frames': num_frames,
+            'world_size': dist.get_world_size(),
+            'save_one_timestep': config['save_one_timestep'],
+        })
+
+    
+    # 初始化mesh
+    mesh = init_context_parallel_mesh(pipe.device.type)
+    
+    # 并行化模型
+    parallelize_model(pipe, mesh, attention_type, attention_args, threshold_attn_args, sink_args, block_avg_args)
+    
+    # 启用VAE tiling
+    pipe.vae.enable_tiling()
+    
+    # 生成视频
+    output = generate_video(pipe, prompt, height, width, num_frames, num_inference_steps, generator_seed)
+    
+    # 保存视频
+    prompt_name = '_'.join(prompt.split(' ')[0:10])
+    output_dir = f"output_videos_new/{prompt_name}/{attention_type}"
+    filename = get_filename(attention_type, config, num_frames)
+    save_video(output, output_dir, filename)
+    
+    # 保存配置
+    if dist.get_rank() == 0:
+        config_file = os.path.join(output_dir, f"config_{filename.replace('.mp4', '.json')}")
+        with open(config_file, 'w') as f:
+            json.dump(config, f, indent=2)
+        print(f"Config saved to: {config_file}")
+    
+    return True
         
-        
-        # 初始化mesh
-        mesh = init_context_parallel_mesh(pipe.device.type)
-        
-        # 并行化模型
-        parallelize_model(pipe, mesh, attention_type, attention_args, threshold_attn_args, sink_args)
-        
-        # 启用VAE tiling
-        pipe.vae.enable_tiling()
-        
-        # 生成视频
-        output = generate_video(pipe, prompt, height, width, num_frames, num_inference_steps, generator_seed)
-        
-        # 保存视频
-        prompt_name = '_'.join(prompt.split(' ')[0:10])
-        output_dir = f"output_videos_new/{prompt_name}/{attention_type}"
-        filename = get_filename(attention_type, config, num_frames)
-        save_video(output, output_dir, filename)
-        
-        # 保存配置
-        if dist.get_rank() == 0:
-            config_file = os.path.join(output_dir, f"config_{filename.replace('.mp4', '.json')}")
-            with open(config_file, 'w') as f:
-                json.dump(config, f, indent=2)
-            print(f"Config saved to: {config_file}")
-        
-        return True
-        
-    except Exception as e:
-        if dist.get_rank() == 0:
-            print(f"Error in experiment: {e}")
-        return False
-    finally:
-        pass
-        # dist.destroy_process_group()
+    # except Exception as e:
+    #     if dist.get_rank() == 0:
+    #         print(f"Error in experiment: {e}")
+    #     return False
+    # finally:
+    #     pass
+    #     # dist.destroy_process_group()
 
 def main():
     """主函数"""
@@ -269,10 +361,12 @@ def main():
     base_config = {
         'height': 544,
         'width': 960,
-        'num_inference_steps': 50,
+        'num_inference_steps': 1,
         'generator_seed': 42,
         'sample_mse_max_row': 64,
         'context_length': 256,
+        'method': 'proportional',
+        'wide_width': 2,
     }
     
     # 提示词列表
@@ -346,60 +440,65 @@ def main():
     #         'num_frames': 393,
     #     })
     
-    # # 6. Pattern attention with different thresholds
-    # threshold_values = [0.3, 0.5, 0.7]
-    # for threshold in threshold_values:
-    #     experiments.append({
-    #         **base_config,
-    #         'attention_type': 'pattern',
-    #         'threshold': threshold,
-    #         'xpos': 0.95,
-    #         'prompt': prompts[0],
-    #         'num_frames': 393,
-    #     })
+    # 6. Pattern attention with different thresholds
     
-    # # 7. Repeat interpolation with different alpha/beta combinations
-    # for prompt in prompts:
-    #     for alpha, beta in alpha_beta_combinations:
-    #         experiments.append({
-    #             **base_config,
-    #             'attention_type': 'interpolation',
-    #             'alpha': alpha,
-    #             'beta': beta,
-    #             'prompt': prompt,
-    #             'num_frames': 393,
-    #         })
+    # experiments.append({
+    #     **base_config,
+    #     'attention_type': 'pattern',
+    #     'prompt': prompts[0],
+    #     'num_frames': 129, # implying one_time_ref is True, cannot change
 
-    # 8. sink 
-    for prompt in prompts:
-        # for sink_width in [4, 1, 0]:
-        #     for window_width in [33]:
-        #         experiments.append({
-        #             **base_config,
-        #             'attention_type': 'sink',
-        #             'prompt': prompt,
-        #             'num_frames': 393,
-        #             'sink_width': sink_width,
-        #             'window_width': window_width,
-        #             'alpha': 1.00,
-        #             'beta': 0.95,
-        #             'narrow_width': 1,
-        #             'wide_width': 2,
-        #         })
-        for sink_width in [0]:
-            for window_width in [33]:
-                experiments.append({
-                    **base_config,
-                    'attention_type': 'sink_pattern',
-                    'prompt': prompt,
-                    'num_frames': 393,
-                    'sink_width': sink_width,
-                    'window_width': window_width,
-                    'alpha': 1.00,
-                    'beta': 0.95,
-                    'narrow_width': 1,
-                    'wide_width': 2,
-                })
+    #     # change below
+    #     'pattern_threshold': 1,
+    #     'narrow_width': 1,
+    # })
+    
+    # # 7. get block avg 
+    # experiments.append({
+    #     **base_config,
+    #     'attention_type': 'get_block_avg',
+    #     'prompt': prompts[0],
+    #     'num_frames': 393,
+
+    #     'save_one_timestep': True,
+    # })
+    
+    experiments.append({
+        **base_config,
+        'attention_type': 'sink',
+        'prompt': prompts[0],
+        'num_frames': 393,
+
+        # --- decay part ---
+        'alpha': 1.00,
+        'beta': 0.95,
+
+        # --- sink part ---
+        'sink_width': 4,
+
+        # --- repeat mask part ---
+        'repeat_mask_in_sink': True,
+
+        # --- sliding window part ---
+        'window_width': 33,  # 这里是直径
+
+        # --- online flags part ---
+        'use_pattern_flags': True,
+        'use_one_time_flags': True,
+        'narrow_width': 1,
+        'pattern_threshold': 1,  
+
+        # --- block avg part ---
+        'use_one_timestep_block_avg': True,
+
+        # --- block bias part ---
+        'use_block_bias': False,
+        'ref_function_name': 'interpolation',
+
+        # --- decay mask part ---
+        'use_decay_mask': True,
+        'decay_mask_threshold': 0.0001,
+    })
     
     # 运行所有实验
     print(f"Total experiments to run: {len(experiments)}")
